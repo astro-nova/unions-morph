@@ -18,8 +18,10 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
     if weightmap:
         vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.weight.fits.fz', 
                    f'{path}/wht_{coords}.fits.fz')
+    
         # Decompress it
         os.system(f'funpack {path}/wht_{coords}.fits.fz')
+        os.remove(f'{path}/wht_{coords}.fits.fz')
 
     # Catalog
     if catalog:
@@ -36,6 +38,7 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
         vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
                    f'{path}/seg_{coords}.fits.fz')
         os.system(f'funpack {path}/seg_{coords}.fits.fz')
+        os.remove(f'{path}/seg_{coords}.fits.fz')
     
     # Photoz catalog
     if photoz:

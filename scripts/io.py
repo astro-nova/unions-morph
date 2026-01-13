@@ -1,6 +1,5 @@
 from vos import Client
-import sys
-sys.path.append('/home/u1/r/rmjarvis/py/lib/python3.8/site-packages/')
+import os
 
 def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=False, 
     star_galaxy=False, photoz=False, path='/scratch/'):
@@ -10,7 +9,7 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
 
     vosclient = Client()
 
-    tilename = f'CFIS_LSB.{tile}.r'
+    tilename = f'CFIS_LSB.{coords}.r'
     if tile:
         vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.fits', 
                        f'{path}/tile_{coords}.fits')

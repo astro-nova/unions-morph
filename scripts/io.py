@@ -29,7 +29,7 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
 
     # Star-galaxy separation
     if star_galaxy:
-        vosclient.copy(f'vos:cfis/Processed_catalogues/StellarClass/stargal.cfis.r.dr5/tile.cats/CFIS.{tile}.r.sg.fits', 
+        vosclient.copy(f'vos:cfis/Processed_catalogues/StellarClass/stargal.cfis.r.dr5/tile.cats/CFIS.{coords}.r.sg.fits', 
                    f'{path}/sg_{coords}.cat')
     
     # Segmentation map

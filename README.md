@@ -27,8 +27,8 @@ This project investigates the connection between **dynamical history**, **galaxy
 
 📓 Example Notebooks
 
-| Notebook | Description |
-|--📁 --------|-------------|
+| 📁 Notebook | Description |
+|----------|-------------|
 | `nbs/s01 Morphology Example.ipynb` | Sample selection, tile data fetching, and morphology calculation for all galaxies in a tile |
 
 

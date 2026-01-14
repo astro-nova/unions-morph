@@ -29,8 +29,7 @@ def select_sample(tile, plot=False):
             (cat.MAG_COG <= 27) &
             (cat.MAG_COG >= 14) &
             (cat.M1-cat.M2 < 1.5) &
-            (cat.M1-cat.M2 > 0.5) &
-            (cat.SB <= 20)
+            (cat.M1-cat.M2 > 0.5) 
            )
     
     # Also from the star-galaxy catalog
@@ -71,6 +70,7 @@ def process_tile(tilerow):
     isophotes = np.arange(22, 26.5, 0.5)
     pxscale = 0.1857  # arcsec/pixel
     fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
+
     for idx, row in sample.iterrows():
         try:
             # Make a cutout

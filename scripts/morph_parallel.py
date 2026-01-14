@@ -126,9 +126,9 @@ if __name__ == '__main__':
     tile_df = pd.read_csv('../catalogs/tiles_r.csv')
 
     # Start delayed joblib run
-    # parallel(n_jobs=16)(
-    #     delayed(process_tile)(row) for idx, row in tqdm(tile_df.iterrows(), total=len(tile_df))
-    # )
-    process_tile(tile_df.iloc[0])
+    parallel(n_jobs=16)(
+        delayed(process_tile)(row) for idx, row in tqdm(tile_df.iterrows(), total=len(tile_df))
+    )
+    # process_tile(tile_df.iloc[0])
 
 

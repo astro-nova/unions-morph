@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 from tqdm.notebook import tqdm
@@ -16,7 +17,7 @@ def process_tile(tilerow):
     tilename = tilerow.tile[-9:-2]
 
     # Download the data from arc to scratch
-    download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=True, star_galaxy=True)
+    download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=False, star_galaxy=True)
 
     # Select galaxies
     cat, sample = select_sample(tilename, plot=False)
@@ -59,6 +60,18 @@ def process_tile(tilerow):
     tile_f.close()
     weightmap_f.close()
     segmap_f.close()
+
+    # Record that this tile is done
+    with open('../catalogs/processed_tiles.csv', 'a') as f:
+        f.write(tilename + '\n')
+
+    # Remove data from scratch
+    os.remove(f'/scratch/tile_{tilename}.fits')
+    os.remove(f'/scratch/wht_{tilename}.fits')
+    os.remove(f'/scratch/seg_{tilename}.fits')
+    os.remove(f'/scratch/cat_{tilename}.cat')
+    os.remove(f'/scratch/sg_{tilename}.cat')
+    
 
 
 if __name__ == '__main__':

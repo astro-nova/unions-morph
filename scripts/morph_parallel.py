@@ -131,7 +131,7 @@ if __name__ == '__main__':
 
     tile_df = pd.read_csv('../catalogs/tiles_r.csv')
     done = pd.read_csv('../catalogs/processed_tiles.csv', names=['coords'])
-    done['tile'] = 'CFIS_LSB.' + done.coords.values.astype(str) + '.r' 
+    done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
     tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
     # Start delayed joblib run

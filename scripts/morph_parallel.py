@@ -20,14 +20,11 @@ def select_sample(tile, plot=False):
     cat = pd.merge(cat, sg, left_index=True, right_index=True)
 
     # Calculate surface brightness and axis ratio proxies
-    cat['SB'] = cat.MAG_COG - 5*np.log10(cat.FLUX_RADIUS)
     cat['Q'] = cat['B_WORLD']/cat['A_WORLD']
     
     # Apply criteria above
     good = ((cat.FLUX_RADIUS >= 4) &
             (cat.FLAGS < 17) &
-            # (cat.SB >= 10) &
-            # (cat.SB <= 30) &
             (cat.Q >= 0.05) &
             (cat.MAG_COG <= 27) &
             (cat.MAG_COG >= 14) &
@@ -54,7 +51,7 @@ def select_sample(tile, plot=False):
         
     print(f'{np.sum(good)} galaxies in the tile')
     return cat, cat[good]
-    
+
 def process_tile(tilerow):
 
     tilename = tilerow.tile[-9:-2]
@@ -72,6 +69,7 @@ def process_tile(tilerow):
 
     # For each galaxy, make a cutout and run statmorph
     isophotes = np.arange(22, 26.5, 0.5)
+    pxscale = 0.1857  # arcsec/pixel
     fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
     for idx, row in sample.iterrows():
         try:

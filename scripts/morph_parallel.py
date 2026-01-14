@@ -12,6 +12,10 @@ sys.path.append('..')
 from lib.io import download_files, make_cutout, parse_morph
 from statmorph_lsst import SourceMorphology
 
+# Suppress warnings from photutils, astropy or statmorph_lsst
+import warnings
+warnings.filterwarnings('ignore')
+
 def select_sample(tile, plot=False):
 
     # Load the source extractor and star-galaxy catalogs

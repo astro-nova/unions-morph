@@ -15,45 +15,52 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
 
     tilename = f'CFIS_LSB.{coords}.r'
     if tile:
-        vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.fits', 
-                       f'{path}/tile_{coords}.fits')
+        # download if doesn't exist already
+        if not os.path.exists(f'{path}/tile_{coords}.fits'):
+            vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.fits', 
+                        f'{path}/tile_{coords}.fits')
 
     # Weightmap
     if weightmap:
-        vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.weight.fits.fz', 
-                   f'{path}/wht_{coords}.fits.fz')
-    
-        # Decompress it
-        os.system(f'funpack {path}/wht_{coords}.fits.fz')
-        os.remove(f'{path}/wht_{coords}.fits.fz')
+        if not os.path.exists(f'{path}/wht_{coords}.fits'):
+            vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.weight.fits.fz', 
+                    f'{path}/wht_{coords}.fits.fz')
+        
+            # Decompress it
+            os.system(f'funpack {path}/wht_{coords}.fits.fz')
+            os.remove(f'{path}/wht_{coords}.fits.fz')
 
     # Catalog
     if catalog:
-        vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.cog.cat', 
-                   f'{path}/cat_{coords}.cat')
+        if not os.path.exists(f'{path}/cat_{coords}.cat'):
+            vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.cog.cat', 
+                    f'{path}/cat_{coords}.cat')
 
     # Star-galaxy separation
     if star_galaxy:
-        vosclient.copy(f'vos:cfis/Processed_catalogues/StellarClass/stargal.cfis.r.dr5/tile.cats/CFIS.{coords}.r.sg.fits', 
-                   f'{path}/sg_{coords}.cat')
+        if not os.path.exists(f'{path}/sg_{coords}.cat'):
+            vosclient.copy(f'vos:cfis/Processed_catalogues/StellarClass/stargal.cfis.r.dr5/tile.cats/CFIS.{coords}.r.sg.fits', 
+                    f'{path}/sg_{coords}.cat')
     
     # Segmentation map
     if segmap:
-        vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
-                   f'{path}/seg_{coords}.fits.fz')
-        os.system(f'funpack {path}/seg_{coords}.fits.fz')
-        os.remove(f'{path}/seg_{coords}.fits.fz')
-    
+        if not os.path.exists(f'{path}/seg_{coords}.fits'):
+                vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
+                    f'{path}/seg_{coords}.fits.fz')
+            os.system(f'funpack {path}/seg_{coords}.fits.fz')
+            os.remove(f'{path}/seg_{coords}.fits.fz')
+        
     # Photoz catalog
     if photoz:
-        try:
-            vosclient.copy(f'vos:cfis/gaap/UNIONS.{coords}_ugriz_photoz_ext.cat', 
-                       f'{path}/photoz_{coords}_ugriz.cat')
-        except HTTPError:
-            vosclient.copy(f'vos:cfis/gaap/UNIONS.{coords}_ugri_photoz_ext.cat', 
-                       f'{path}/photoz_{coords}_ugriz.cat')
-        except:
-            print('No photo-z catalog available yet')
+        if not os.path.exists(f'{path}/photoz_{coords}_ugriz.cat'):
+            try:
+                vosclient.copy(f'vos:cfis/gaap/UNIONS.{coords}_ugriz_photoz_ext.cat', 
+                        f'{path}/photoz_{coords}_ugriz.cat')
+            except HTTPError:
+                vosclient.copy(f'vos:cfis/gaap/UNIONS.{coords}_ugri_photoz_ext.cat', 
+                        f'{path}/photoz_{coords}_ugriz.cat')
+            except:
+                print('No photo-z catalog available yet')
 
 def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     """ Make cutouts of a galaxy from the tile, weightmap and segmentation map.

@@ -1,4 +1,6 @@
 from vos import Client
+import numpy as np
+from skimage import transform as T
 import os
 
 def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=False, 
@@ -60,9 +62,9 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
 
     # Cutout size
     xc, yc = int(galaxy.X_IMAGE+0.5), int(galaxy.Y_IMAGE+0.5)
-    axis_ratio = max([0.5, galaxy.Q])
-    size = int(galaxy.r_frac*2 /axis_ratio )
-    size = np.min(size, cutout_min)
+    axis_ratio = np.max([0.5, galaxy.Q])
+    size = int(r_frac*2 /axis_ratio )
+    size = np.min([size, cutout_min])
 
     # If the cutout goes beyond the image edges, adjust the slices.
     # Compact formulation. 
@@ -78,7 +80,7 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
 
     # Load the empirical PSF
     psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')
-    fwhm = cat.PREDIQ
+    fwhm = galaxy.PREDIQ
     # Generate the PSF with that FWHM from the psfex fit
     psf = T.rescale(psf_1arcsec, (fwhm/1))
     psf = psf/np.sum(psf)

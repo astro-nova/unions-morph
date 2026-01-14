@@ -12,6 +12,49 @@ sys.path.append('..')
 from lib.io import download_files, make_cutout, parse_morph
 from statmorph_lsst import SourceMorphology
 
+def select_sample(tile, plot=False):
+
+    # Load the source extractor and star-galaxy catalogs
+    cat = Table.read(f'/scratch/cat_{tile}.cat', format='ascii').to_pandas()
+    sg = Table.read(f'/scratch/sg_{tile}.cat').to_pandas()[['M1','M2','M3','s21','s31']]
+    cat = pd.merge(cat, sg, left_index=True, right_index=True)
+
+    # Calculate surface brightness and axis ratio proxies
+    cat['SB'] = cat.MAG_COG - 5*np.log10(cat.FLUX_RADIUS)
+    cat['Q'] = cat['B_WORLD']/cat['A_WORLD']
+    
+    # Apply criteria above
+    good = ((cat.FLUX_RADIUS >= 4) &
+            (cat.FLAGS < 17) &
+            # (cat.SB >= 10) &
+            # (cat.SB <= 30) &
+            (cat.Q >= 0.05) &
+            (cat.MAG_COG <= 27) &
+            (cat.MAG_COG >= 14) &
+            (cat.M1-cat.M2 < 1.5) &
+            (cat.M1-cat.M2 > 0.5) &
+            (cat.SB <= 20)
+           )
+    
+    # Also from the star-galaxy catalog
+    stars = (cat.MAG_COG < 23.5) & (cat.M1-cat.M2 >= 0.63) & (cat.M1-cat.M2 < 0.75)
+    stars = (cat.s21 < 3) | (cat.s31 < 3)
+    
+    # Plot the selected sample
+    if plot:
+        fig, ax = plt.subplots(1,1, figsize=(8,5))
+        plt.scatter(cat.MAG_COG, cat.M1-cat.M2, s=1, alpha=0.1, c='k')
+        plt.scatter(cat[good].MAG_COG, cat[good].M1-cat[good].M2, s=1, alpha=0.5, c='b')
+        plt.scatter(cat[stars].MAG_COG, cat[stars].M1-cat[stars].M2, s=1, alpha=0.5, c='r')
+        plt.xlim(14, 28)
+        plt.ylim(-0.5, 1.5)
+        plt.colorbar()
+
+    good = good & ~stars
+        
+    print(f'{np.sum(good)} galaxies in the tile')
+    return cat, cat[good]
+    
 def process_tile(tilerow):
 
     tilename = tilerow.tile[-9:-2]

@@ -78,6 +78,11 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     err = weightmap[1].data[slices]
     mask = err==0
 
+    # Only select the source in the segmap
+    source = segmap[yc, xc]
+    segmap.data[(segmap.data > 0) & (segmap.data != source)] = 2
+    segmap.data[segmap.data == source] = 1
+
     # Load the empirical PSF
     psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')
     fwhm = galaxy.PREDIQ

@@ -105,7 +105,7 @@ def parse_morph(out_dict, morph):
     qs += ['flag','flag_sersic']
     isophotes = np.arange(22, 26.5, 0.5)
     for q in qs:
-        if q == 'isophote_asymetry':
+        if q == 'isophote_asymmetry':
             aisos = morph.__getattribute__(q)
             for sblim, aiso in zip(isophotes, aisos):
                 out_dict[f'aiso_{sblim:0.1f}'] = aiso

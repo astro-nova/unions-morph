@@ -79,6 +79,8 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     mask = err==0
 
     # Only select the source in the segmap
+    xc = img.shape[1]//2
+    yc = img.shape[0]//2
     source = segmap[yc, xc]
     segmap.data[(segmap.data > 0) & (segmap.data != source)] = 2
     segmap.data[segmap.data == source] = 1

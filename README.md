@@ -1,4 +1,3 @@
-<div align="center">
 
 # 🌌 unions-morph
 
@@ -66,8 +65,7 @@ git commit -m "Describe your changes"
 git push origin your-branch-name
 ```
 
-**4️⃣ Open a pull request** in GitHub to merge your changes into the main branch.it push origin your-branch-name
-```
+** 4️⃣ Open a pull request** in GitHub to merge your changes into the main branch.it push origin your-branch-name
 
 When ready, open a pull request in github to merge your changes into the main branch.
 
@@ -79,5 +77,3 @@ If you use this code or data in your research, please cite the Taylor group's re
 
 For questions or collaboration inquiries, please contact the Taylor group.
 
----
-</divs>

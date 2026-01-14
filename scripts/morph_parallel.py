@@ -6,7 +6,7 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 
 import numpy as np
 import pandas as pd
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from joblib import Parallel, delayed
 from astropy.io import fits
 from astropy.table import Table
@@ -79,8 +79,6 @@ def process_tile(tilerow):
         fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
 
         for idx, row in sample.iterrows():
-            if idx > 100:
-                break
             try:
                 # Make a cutout
                 img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
@@ -97,7 +95,7 @@ def process_tile(tilerow):
                 res = parse_morph(res, morph)
 
                 # Write the output
-                out_file = f'../catalogs/morph.csv'
+                out_file = f'../catalogs/morph_new.csv'
                 with open(out_file, 'a') as f:
                     # If filesize is 0 write header
                     if f.tell() == 0:
@@ -112,7 +110,7 @@ def process_tile(tilerow):
         segmap_f.close()
 
         # Record that this tile is done
-        with open('../catalogs/processed_tiles.csv', 'a') as f:
+        with open('../catalogs/processed_tiles_new.csv', 'a') as f:
             f.write(tilename + '\n')
 
         # Remove data from scratch
@@ -130,9 +128,9 @@ def process_tile(tilerow):
 if __name__ == '__main__':
 
     tile_df = pd.read_csv('../catalogs/tiles_r.csv')
-    done = pd.read_csv('../catalogs/processed_tiles.csv', names=['coords'])
-    done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
-    tile_df = tile_df[~tile_df.tile.isin(done.tile)]
+    # done = pd.read_csv('../catalogs/processed_tiles2.csv', names=['coords'])
+    # done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
+    # tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
     # Start delayed joblib run
     Parallel(n_jobs=16)(

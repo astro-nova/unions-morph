@@ -208,3 +208,4 @@ __marimo__/
 # Project specific - heavy data files
 data/
 catalogs/morph.csv
+catalogs/morph_new.csv

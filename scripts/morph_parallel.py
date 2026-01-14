@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from tqdm.notebook import tqdm
-from joblib import paeallel, delayed
+from joblib import parallel, delayed
 from astropy.io import fits
 from astropy.table import Table
 from astropy.stats import sigma_clipped_stats

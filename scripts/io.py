@@ -63,7 +63,7 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     # Cutout size
     xc, yc = int(galaxy.X_IMAGE+0.5), int(galaxy.Y_IMAGE+0.5)
     axis_ratio = np.max([0.5, galaxy.Q])
-    size = int(r_frac*2 /axis_ratio )
+    size = int(galaxy.FLUX_RADIUS*r_frac /axis_ratio )
     size = np.min([size, cutout_min])
 
     # If the cutout goes beyond the image edges, adjust the slices.

@@ -50,3 +50,37 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
                        f'{path}/photoz_{coords}_ugriz.cat')
         except:
             print('No photo-z catalog available yet')
+
+
+def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
+    """ Make cutouts of a galaxy from the tile, weightmap and segmentation map.
+    `galaxy` is a row from the catalog dataframe. `tile`, `weightmap` and `segmap` are  
+    the opened fits files. `cutout_min` is the minimum size of the cutout in pixels.
+    `r_frac` is the factor multiplied by FLUX_RADIUS to define the cutout size. """
+
+    # Cutout size
+    xc, yc = int(galaxy.X_IMAGE+0.5), int(galaxy.Y_IMAGE+0.5)
+    axis_ratio = max([0.5, galaxy.Q])
+    size = int(galaxy.r_frac*2 /axis_ratio )
+    size = np.min(size, cutout_min)
+
+    # If the cutout goes beyond the image edges, adjust the slices.
+    # Compact formulation. 
+    y_start, y_end = max(0, yc-size), min(tile[0].data.shape[0], yc+size)
+    x_start, x_end = max(0, xc-size), min(tile[0].data.shape[1], xc+size)
+    slices = slice(y_start, y_end), slice(x_start, x_end)
+
+    # Make cutouts 
+    img = tile[0].data[slices]
+    segmap = segmap[1].data[slices]
+    err = weightmap[1].data[slices]
+    mask = err==0
+
+    # Load the empirical PSF
+    psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')
+    fwhm = cat.PREDIQ
+    # Generate the PSF with that FWHM from the psfex fit
+    psf = T.rescale(psf_1arcsec, (fwhm/1))
+    psf = psf/np.sum(psf)
+    
+    return img, err, segmap, mask, psf

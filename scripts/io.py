@@ -82,8 +82,8 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     xc = img.shape[1]//2
     yc = img.shape[0]//2
     source = segmap[yc, xc]
-    segmap.data[(segmap.data > 0) & (segmap.data != source)] = 2
-    segmap.data[segmap.data == source] = 1
+    segmap[(segmap > 0) & (segmap != source)] = 2
+    segmap[segmap == source] = 1
 
     # Load the empirical PSF
     psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')

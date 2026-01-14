@@ -97,30 +97,31 @@ def process_tile(tile):
         fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
 
         for idx, row in sample.iterrows():
-            try:
-                # Make a cutout
-                img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
-                # Run statmorph
-                morph = SourceMorphology(
-                    img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
-                    interpolate_mask=False, asymmetry_isophotes=fluxes,
-                    sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
-                )
-                # Parse output
-                res = {
-                    'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
-                    'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
-                res = parse_morph(res, morph)
+            # try:
+            # Make a cutout
+            img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
+            # Run statmorph
+            morph = SourceMorphology(
+                img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
+                interpolate_mask=False, asymmetry_isophotes=fluxes,
+                sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
+            )
+            # Parse output
+            res = {
+                'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
+                'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
+            res = parse_morph(res, morph)
 
-                # Write the output
-                out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new.csv'
-                with open(out_file, 'a') as f:
-                    # If filesize is 0 write header
-                    if f.tell() == 0:
-                        f.write(','.join(res.keys()) + '\n')
-                    f.write(','.join([str(v) for v in res.values()]) + '\n')
-            except:
-                continue
+            # Write the output
+            out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new.csv'
+            with open(out_file, 'a') as f:
+                # If filesize is 0 write header
+                if f.tell() == 0:
+                    f.write(','.join(res.keys()) + '\n')
+                f.write(','.join([str(v) for v in res.values()]) + '\n')
+            logger.info(f"Done galaxy {idx}")
+            # except:
+            #     continue
 
         # Close files
         tile_f.close()
@@ -149,12 +150,12 @@ def parallel_processing():
 
     # Get available CPU cores (leave 1 for system)
     n_cores = max(1, cpu_count() - 1)
+    n_cores = 1
 
     tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
     done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
     done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
     tile_df = tile_df[~tile_df.tile.isin(done.tile)]
-
 
     # Create partial function with fixed parameters
     process_func = partial(process_tile)
@@ -164,20 +165,6 @@ def parallel_processing():
         results = pool.map(process_func, tile_df.tile.values)
 
     return results
-
-def timed_processing(func, *args, **kwargs):
-
-
-    try:
-        result = func(*args, **kwargs)
-        elapsed = time.time() - start_time
-        logger.info(f"Completed {func.__name__} in {elapsed:.2f} seconds")
-        return result
-    except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(f"Failed {func.__name__} after {elapsed:.2f} seconds: {e}")
-        raise
-
 
 if __name__ == '__main__':
 

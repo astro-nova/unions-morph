@@ -1,6 +1,7 @@
 from vos import Client
 import numpy as np
 from skimage import transform as T
+from astropy.stats import sigma_clipped_stats
 import os
 
 def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=False, 
@@ -85,6 +86,10 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     segmap[(segmap > 0) & (segmap != source)] = 2
     segmap[segmap == source] = 1
 
+    # Estimate and subtract a flat background
+    bgmean, bgmed, bgsd = sigma_clipped_stats(img, mask=mask|(segmap>0))
+    img -= bgmed
+
     # Load the empirical PSF
     psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')
     fwhm = galaxy.PREDIQ
@@ -92,4 +97,4 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     psf = T.rescale(psf_1arcsec, (fwhm/1))
     psf = psf/np.sum(psf)
     
-    return img, err, segmap, mask, psf
+    return img, err, segmap, mask, psf, bgsd

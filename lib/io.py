@@ -45,8 +45,8 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
     # Segmentation map
     if segmap:
         if not os.path.exists(f'{path}/seg_{coords}.fits'):
-                vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
-                    f'{path}/seg_{coords}.fits.fz')
+            vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
+                f'{path}/seg_{coords}.fits.fz')
             os.system(f'funpack {path}/seg_{coords}.fits.fz')
             os.remove(f'{path}/seg_{coords}.fits.fz')
         

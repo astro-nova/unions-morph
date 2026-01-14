@@ -7,13 +7,13 @@ os.environ['PYTHONWARNINGS'] = 'ignore'
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, cpu_count
 from astropy.io import fits
 from astropy.table import Table
 from astropy.stats import sigma_clipped_stats
 
 import sys
-sys.path.append('..')
+sys.path.append('/arc/home/esazonova/unions-morph')
 from lib.io import download_files, make_cutout, parse_morph
 from statmorph_lsst import SourceMorphology
 
@@ -95,7 +95,7 @@ def process_tile(tilerow):
                 res = parse_morph(res, morph)
 
                 # Write the output
-                out_file = f'../catalogs/morph_new.csv'
+                out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new.csv'
                 with open(out_file, 'a') as f:
                     # If filesize is 0 write header
                     if f.tell() == 0:
@@ -110,7 +110,7 @@ def process_tile(tilerow):
         segmap_f.close()
 
         # Record that this tile is done
-        with open('../catalogs/processed_tiles_new.csv', 'a') as f:
+        with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:
             f.write(tilename + '\n')
 
         # Remove data from scratch
@@ -127,13 +127,14 @@ def process_tile(tilerow):
 
 if __name__ == '__main__':
 
-    tile_df = pd.read_csv('../catalogs/tiles_r.csv')
-    # done = pd.read_csv('../catalogs/processed_tiles2.csv', names=['coords'])
-    # done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
-    # tile_df = tile_df[~tile_df.tile.isin(done.tile)]
+    tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
+    done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
+    done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
+    tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
     # Start delayed joblib run
-    Parallel(n_jobs=16)(
+    njobs = 16
+    Parallel(n_jobs=njobs)(
         delayed(process_tile)(row) for idx, row in tqdm(tile_df.iterrows(), total=len(tile_df))
     )
     # process_tile(tile_df.iloc[0])

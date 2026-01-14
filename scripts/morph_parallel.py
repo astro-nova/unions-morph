@@ -76,6 +76,8 @@ def process_tile(tilerow):
     fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
 
     for idx, row in sample.iterrows():
+        if idx > 100:
+            break
         try:
             # Make a cutout
             img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)

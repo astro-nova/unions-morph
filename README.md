@@ -67,8 +67,7 @@ git commit -m "Describe your changes"
 git push origin your-branch-name
 ```
 
-** 4️⃣ Open a pull request** in GitHub to merge your changes into the main branch.it push origin your-branch-name
-
+** 4️⃣ Open a pull request**
 When ready, open a pull request in github to merge your changes into the main branch.
 
 ## 📚 Citation

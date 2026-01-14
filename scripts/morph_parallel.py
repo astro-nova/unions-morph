@@ -59,6 +59,7 @@ def select_sample(tile, plot=False):
 def process_tile(tilerow):
 
     try:
+        print(f'Processing tile {tilerow.tile}')
         tilename = tilerow.tile[-9:-2]
 
         # Download the data from arc to scratch
@@ -129,6 +130,8 @@ def process_tile(tilerow):
 if __name__ == '__main__':
 
     tile_df = pd.read_csv('../catalogs/tiles_r.csv')
+    done_tiles = pd.read_csv('../catalogs/processed_tiles.csv', header=None)[0].tolist()
+    tile_df = tile_df[~tile_df.tile.str[-9:-2].isin(done_tiles)].reset_index(drop=True)
 
     # Start delayed joblib run
     Parallel(n_jobs=16)(

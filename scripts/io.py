@@ -2,6 +2,7 @@ from vos import Client
 import numpy as np
 from skimage import transform as T
 from astropy.stats import sigma_clipped_stats
+from statmorph_lsst import _quantity_names
 import os
 
 def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=False, 
@@ -54,7 +55,6 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
         except:
             print('No photo-z catalog available yet')
 
-
 def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     """ Make cutouts of a galaxy from the tile, weightmap and segmentation map.
     `galaxy` is a row from the catalog dataframe. `tile`, `weightmap` and `segmap` are  
@@ -98,3 +98,17 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     psf = psf/np.sum(psf)
     
     return img, err, segmap, mask, psf, bgsd
+
+def parse_morph(out_dict, morph):
+
+    qs = _quantity_names
+    qs += ['flag','flag_sersic']
+    isophotes = np.arange(22, 26.5, 0.5)
+    for q in qs:
+        if q == 'isophote_asymetry':
+            aisos = morph.__getattribute__(q)
+            for sblim, aiso in zip(isophotes, aisos):
+                out_dict[f'aiso_{sblim:0.1f}'] = aiso
+        else:
+            out_dict[q] = morph.__getattribute__(q)
+    return out_dict

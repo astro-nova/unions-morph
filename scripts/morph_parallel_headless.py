@@ -159,9 +159,11 @@ def parallel_processing():
     # Create partial function with fixed parameters
     process_func = partial(process_tile)
 
-    # Process files in parallel
-    with Pool(n_cores) as pool:
-        results = pool.map(process_func, tile_df.tile.values)
+    # Process files in parallel with strict control over concurrent tasks
+    # maxtasksperchild=1 ensures each worker only handles one tile at a time
+    # imap with chunksize=1 prevents batching of multiple tiles to workers
+    with Pool(n_cores, maxtasksperchild=1) as pool:
+        results = list(pool.imap(process_func, tile_df.tile.values, chunksize=1))
 
     return results
 

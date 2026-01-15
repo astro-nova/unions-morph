@@ -174,6 +174,6 @@ if __name__ == '__main__':
     # update please
 
     tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
-    process_tile(tile_df.iloc[0])
+    process_tile(tile_df.iloc[0].tile)
 
 

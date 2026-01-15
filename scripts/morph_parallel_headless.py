@@ -119,7 +119,7 @@ def process_tile(tile):
                     if f.tell() == 0:
                         f.write(','.join(res.keys()) + '\n')
                     f.write(','.join([str(v) for v in res.values()]) + '\n')
-                # logger.info(f"Done galaxy {idx}")
+                logger.info(f"Done tile {tilename}galaxy {idx}")
             except:
                 continue
 

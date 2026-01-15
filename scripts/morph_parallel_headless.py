@@ -97,33 +97,33 @@ def process_tile(tile):
     fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
 
     for idx, row in sample.iterrows():
-        if idx > 100:
+        if idx > 300:
             break
-        # try:
-        # Make a cutout
-        img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
-        # Run statmorph
-        morph = SourceMorphology(
-            img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
-            interpolate_mask=False, asymmetry_isophotes=fluxes,
-            sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
-        )
-        # Parse output
-        res = {
-            'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
-            'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
-        res = parse_morph(res, morph)
+        try:
+            # Make a cutout
+            img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
+            # Run statmorph
+            morph = SourceMorphology(
+                img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
+                interpolate_mask=False, asymmetry_isophotes=fluxes,
+                sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
+            )
+            # Parse output
+            res = {
+                'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
+                'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
+            res = parse_morph(res, morph)
 
-        # Write the output
-        out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new2.csv'
-        with open(out_file, 'a') as f:
-            # If filesize is 0 write header
-            if f.tell() == 0:
-                f.write(','.join(res.keys()) + '\n')
-            f.write(','.join([str(v) for v in res.values()]) + '\n')
-        logger.info(f"Done galaxy {idx}")
-        # except:
-        #     continue
+            # Write the output
+            out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new2.csv'
+            with open(out_file, 'a') as f:
+                # If filesize is 0 write header
+                if f.tell() == 0:
+                    f.write(','.join(res.keys()) + '\n')
+                f.write(','.join([str(v) for v in res.values()]) + '\n')
+            logger.info(f"Done galaxy {idx}")
+        except:
+            continue
 
     # Close files
     tile_f.close()

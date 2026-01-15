@@ -115,50 +115,50 @@ def process_galaxy(args):
 
 def process_tile(tile):
 
-    try:
-        print(f'Processing tile {tile}')
-        tilename = tile[-9:-2]
+    # try:
+    print(f'Processing tile {tile}')
+    tilename = tile[-9:-2]
 
-        # Download the data from arc to scratch
-        download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=False, star_galaxy=True)
+    # Download the data from arc to scratch
+    download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=False, star_galaxy=True)
 
-        # Select galaxies
-        cat, sample = select_sample(tilename, plot=False)
+    # Select galaxies
+    cat, sample = select_sample(tilename, plot=False)
 
-        # Open files and load data into memory
-        tile_f = fits.open(f'/scratch/tile_{tilename}.fits')
-        weightmap_f = fits.open(f'/scratch/wht_{tilename}.fits')
-        segmap_f = fits.open(f'/scratch/seg_{tilename}.fits')
-        
-        # Prepare arguments for parallel galaxy processing
-        galaxy_args = [
-            (idx, row, tilename, tile_f, weightmap_f, segmap_f)
-            for idx, row in sample.iterrows()
-        ]
-        
-        # Process galaxies in parallel
-        n_cores = max(1, cpu_count() - 1)
-        with Pool(n_cores) as pool:
-            results = pool.map(process_galaxy, galaxy_args)
-        
-        # Close files immediately
-        tile_f.close()
-        weightmap_f.close()
-        segmap_f.close()
+    # Open files and load data into memory
+    tile_f = fits.open(f'/scratch/tile_{tilename}.fits')
+    weightmap_f = fits.open(f'/scratch/wht_{tilename}.fits')
+    segmap_f = fits.open(f'/scratch/seg_{tilename}.fits')
+    
+    # Prepare arguments for parallel galaxy processing
+    galaxy_args = [
+        (idx, row, tilename, tile_f, weightmap_f, segmap_f)
+        for idx, row in sample.iterrows()
+    ]
+    
+    # Process galaxies in parallel
+    n_cores = max(1, cpu_count() - 1)
+    with Pool(n_cores) as pool:
+        results = pool.map(process_galaxy, galaxy_args)
+    
+    # Close files immediately
+    tile_f.close()
+    weightmap_f.close()
+    segmap_f.close()
 
-        # Record that this tile is done
-        with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:
-            f.write(tilename + '\n')
+    # Record that this tile is done
+    with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:
+        f.write(tilename + '\n')
 
-        # Remove data from scratch
-        os.remove(f'/scratch/tile_{tilename}.fits')
-        os.remove(f'/scratch/wht_{tilename}.fits')
-        os.remove(f'/scratch/seg_{tilename}.fits')
-        os.remove(f'/scratch/cat_{tilename}.cat')
-        os.remove(f'/scratch/sg_{tilename}.cat')
-        logger.info(f"Completed processing tile {tile}")
-    except:
-        logger.info(f'Error processing tile {tile}')
+    # Remove data from scratch
+    os.remove(f'/scratch/tile_{tilename}.fits')
+    os.remove(f'/scratch/wht_{tilename}.fits')
+    os.remove(f'/scratch/seg_{tilename}.fits')
+    os.remove(f'/scratch/cat_{tilename}.cat')
+    os.remove(f'/scratch/sg_{tilename}.cat')
+    logger.info(f"Completed processing tile {tile}")
+    # except:
+    #     logger.info(f'Error processing tile {tile}')
 
     
 

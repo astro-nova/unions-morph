@@ -113,7 +113,7 @@ def process_galaxy(args):
                 f.write(','.join(res.keys()) + '\n')
             f.write(','.join([str(v) for v in res.values()]) + '\n')
 
-        logger.info(f"Done tile {tilename} galaxy {idx}")
+        # logger.info(f"Done tile {tilename} galaxy {idx}")
 
         tile_f.close()
         weightmap_f.close()
@@ -125,40 +125,40 @@ def process_galaxy(args):
 
 def process_tile(tile):
 
-    # try:
-    print(f'Processing tile {tile}')
-    tilename = tile[-9:-2]
+    try:
+        print(f'Processing tile {tile}')
+        tilename = tile[-9:-2]
 
-    # Download the data from arc to scratch
-    download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=False, star_galaxy=True)
+        # Download the data from arc to scratch
+        download_files(tilename, tile=True, catalog=True, weightmap=True, segmap=True, photoz=False, star_galaxy=True)
 
-    # Select galaxies
-    cat, sample = select_sample(tilename, plot=False)
-    
-    # Prepare arguments for parallel galaxy processing
-    galaxy_args = [
-        (idx, row, tilename)
-        for idx, row in sample.iterrows()
-    ]
-    
-    # Process galaxies in parallel
-    n_cores = max(1, cpu_count() - 1)
-    with Pool(n_cores) as pool:
-        results = pool.map(process_galaxy, galaxy_args)
+        # Select galaxies
+        cat, sample = select_sample(tilename, plot=False)
+        
+        # Prepare arguments for parallel galaxy processing
+        galaxy_args = [
+            (idx, row, tilename)
+            for idx, row in sample.iterrows()
+        ]
+        
+        # Process galaxies in parallel
+        n_cores = max(1, cpu_count() - 1)
+        with Pool(n_cores) as pool:
+            results = pool.map(process_galaxy, galaxy_args)
 
-    # Record that this tile is done
-    with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:
-        f.write(tilename + '\n')
+        # Record that this tile is done
+        with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:
+            f.write(tilename + '\n')
 
-    # Remove data from scratch
-    os.remove(f'/scratch/tile_{tilename}.fits')
-    os.remove(f'/scratch/wht_{tilename}.fits')
-    os.remove(f'/scratch/seg_{tilename}.fits')
-    os.remove(f'/scratch/cat_{tilename}.cat')
-    os.remove(f'/scratch/sg_{tilename}.cat')
-    logger.info(f"Completed processing tile {tile}")
-    # except:
-    #     logger.info(f'Error processing tile {tile}')
+        # Remove data from scratch
+        os.remove(f'/scratch/tile_{tilename}.fits')
+        os.remove(f'/scratch/wht_{tilename}.fits')
+        os.remove(f'/scratch/seg_{tilename}.fits')
+        os.remove(f'/scratch/cat_{tilename}.cat')
+        os.remove(f'/scratch/sg_{tilename}.cat')
+        logger.info(f"Completed processing tile {tile}")
+    except:
+        logger.info(f'Error processing tile {tile}')
 
     
 
@@ -174,7 +174,3 @@ if __name__ == '__main__':
     # Process each tile sequentially
     for i, tile in enumerate(tile_df.tile.values):
         process_tile(tile)
-        if i > 0:
-            break
-
-

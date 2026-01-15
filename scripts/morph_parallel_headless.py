@@ -74,6 +74,45 @@ def select_sample(tile, plot=False):
     logger.info(f'{np.sum(good)} galaxies in the tile')
     return cat, cat[good]
 
+
+def process_galaxy(args):
+    """Process a single galaxy from a tile"""
+    idx, row, tilename, tile_f, weightmap_f, segmap_f = args
+    try:
+        
+        # Make a cutout
+        img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
+        
+        # Run statmorph
+        isophotes = np.arange(22, 26.5, 0.5)
+        pxscale = 0.1857  # arcsec/pixel
+        fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
+        
+        morph = SourceMorphology(
+            img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
+            interpolate_mask=False, asymmetry_isophotes=fluxes,
+            sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
+        )
+        
+        # Parse output
+        res = {
+            'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
+            'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
+        res = parse_morph(res, morph)
+
+        # Write result to file immediately
+        out_file = '/arc/home/esazonova/unions-morph/catalogs/morph_new2.csv'
+        with open(out_file, 'a') as f:
+            # If filesize is 0 write header
+            if f.tell() == 0:
+                f.write(','.join(res.keys()) + '\n')
+            f.write(','.join([str(v) for v in res.values()]) + '\n')
+
+        logger.info(f"Done tile {tilename} galaxy {idx}")
+    except Exception as e:
+        logger.error(f"Error processing galaxy {idx} in tile {tilename}: {str(e)}")
+
+
 def process_tile(tile):
 
     try:
@@ -86,44 +125,23 @@ def process_tile(tile):
         # Select galaxies
         cat, sample = select_sample(tilename, plot=False)
 
-        # Open files
+        # Open files and load data into memory
         tile_f = fits.open(f'/scratch/tile_{tilename}.fits')
         weightmap_f = fits.open(f'/scratch/wht_{tilename}.fits')
         segmap_f = fits.open(f'/scratch/seg_{tilename}.fits')
-
-        # For each galaxy, make a cutout and run statmorph
-        isophotes = np.arange(22, 26.5, 0.5)
-        pxscale = 0.1857  # arcsec/pixel
-        fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
-
-        for idx, row in sample.iterrows():
-            try:
-                # Make a cutout
-                img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
-                # Run statmorph
-                morph = SourceMorphology(
-                    img, segmap, label=1, weightmap=err, mask=mask, psf=psf, 
-                    interpolate_mask=False, asymmetry_isophotes=fluxes,
-                    sersic_model_args={'bounds' : {'n' : (0.1, 6)}}
-                )
-                # Parse output
-                res = {
-                    'tile' : tilename, 'idx' : row.name, 'ra': row['ALPHA_J2000'], 
-                    'dec' : row['DELTA_J2000'], 'fwhm' : row.PREDIQ}
-                res = parse_morph(res, morph)
-
-                # Write the output
-                out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new2.csv'
-                with open(out_file, 'a') as f:
-                    # If filesize is 0 write header
-                    if f.tell() == 0:
-                        f.write(','.join(res.keys()) + '\n')
-                    f.write(','.join([str(v) for v in res.values()]) + '\n')
-                logger.info(f"Done tile {tilename}galaxy {idx}")
-            except:
-                continue
-
-        # Close files
+        
+        # Prepare arguments for parallel galaxy processing
+        galaxy_args = [
+            (idx, row, tilename, tile_f, weightmap_f, segmap_f)
+            for idx, row in sample.iterrows()
+        ]
+        
+        # Process galaxies in parallel
+        n_cores = max(1, cpu_count() - 1)
+        with Pool(n_cores) as pool:
+            results = pool.map(process_galaxy, galaxy_args)
+        
+        # Close files immediately
         tile_f.close()
         weightmap_f.close()
         segmap_f.close()
@@ -145,32 +163,18 @@ def process_tile(tile):
     
 
 
-def parallel_processing():
-    """Process multiple files in parallel"""
+if __name__ == '__main__':
 
-    # Get available CPU cores (leave 1 for system)
-    n_cores = max(1, cpu_count() - 1)
-
+    # Load tile list
     tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
     # done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
     # done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
     # tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
-    # Create partial function with fixed parameters
-    process_func = partial(process_tile)
-
-    # Process files in parallel with strict control over concurrent tasks
-    # maxtasksperchild=1 ensures each worker only handles one tile at a time
-    # imap with chunksize=1 prevents batching of multiple tiles to workers
-    with Pool(n_cores, maxtasksperchild=1) as pool:
-        results = list(pool.imap(process_func, tile_df.tile.values, chunksize=1))
-
-    return results
-
-if __name__ == '__main__':
-
-    parallel_processing()
-    # tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
-    # process_tile(tile_df.iloc[0].tile)
+    # Process each tile sequentially
+    for i, tile in enumerate(tile_df.tile.values):
+        process_tile(tile)
+        if i > 0:
+            break
 
 

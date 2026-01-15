@@ -97,6 +97,8 @@ def process_tile(tile):
         fluxes = pxscale**2 * np.power(10, -(isophotes-30)/2.5)
 
         for idx, row in sample.iterrows():
+            if idx > 100:
+                break
             # try:
             # Make a cutout
             img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
@@ -113,7 +115,7 @@ def process_tile(tile):
             res = parse_morph(res, morph)
 
             # Write the output
-            out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new.csv'
+            out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_new2.csv'
             with open(out_file, 'a') as f:
                 # If filesize is 0 write header
                 if f.tell() == 0:
@@ -168,8 +170,8 @@ def parallel_processing():
 
 if __name__ == '__main__':
 
-    parallel_processing()
+    # parallel_processing()
 
-    # process_tile(tile_df.iloc[0])
+    process_tile(tile_df.iloc[0])
 
 

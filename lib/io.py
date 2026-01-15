@@ -98,7 +98,7 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     img -= bgmed
 
     # Load the empirical PSF
-    psf_1arcsec = np.load(f'../data/psf_1arcsec.npy')
+    psf_1arcsec = np.load(f'/arc/home/esazonova/unions-morph/data/psf_1arcsec.npy')
     fwhm = galaxy.PREDIQ
     # Generate the PSF with that FWHM from the psfex fit
     psf = T.rescale(psf_1arcsec, (fwhm/1))

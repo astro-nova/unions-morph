@@ -4,6 +4,7 @@ from skimage import transform as T
 from astropy.stats import sigma_clipped_stats
 from statmorph_lsst import _quantity_names
 import os
+import subprocess
 
 def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=False, 
     star_galaxy=False, photoz=False, path='/scratch/'):
@@ -27,7 +28,7 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
                     f'{path}/wht_{coords}.fits.fz')
         
             # Decompress it
-            os.system(f'funpack {path}/wht_{coords}.fits.fz')
+            subprocess.run(['funpack', f'{path}/wht_{coords}.fits.fz'], check=True)
             os.remove(f'{path}/wht_{coords}.fits.fz')
 
     # Catalog
@@ -47,7 +48,7 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
         if not os.path.exists(f'{path}/seg_{coords}.fits'):
             vosclient.copy(f'vos:cfis/tiles_DR5/CFIS.{coords}.r.seg.fits.fz', 
                 f'{path}/seg_{coords}.fits.fz')
-            os.system(f'funpack {path}/seg_{coords}.fits.fz')
+            subprocess.run(['funpack', f'{path}/seg_{coords}.fits.fz'], check=True)
             os.remove(f'{path}/seg_{coords}.fits.fz')
         
     # Photoz catalog

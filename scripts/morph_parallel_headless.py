@@ -77,8 +77,13 @@ def select_sample(tile, plot=False):
 
 def process_galaxy(args):
     """Process a single galaxy from a tile"""
-    idx, row, tilename, tile_f, weightmap_f, segmap_f = args
+    idx, row, tilename = args
     try:
+        
+        # Open files and load data into memory
+        tile_f = fits.open(f'/scratch/tile_{tilename}.fits')
+        weightmap_f = fits.open(f'/scratch/wht_{tilename}.fits')
+        segmap_f = fits.open(f'/scratch/seg_{tilename}.fits')
         
         # Make a cutout
         img, err, segmap, mask, psf, bgsd = make_cutout(row, tile_f, weightmap_f, segmap_f, r_frac=4)
@@ -109,6 +114,11 @@ def process_galaxy(args):
             f.write(','.join([str(v) for v in res.values()]) + '\n')
 
         logger.info(f"Done tile {tilename} galaxy {idx}")
+
+        tile_f.close()
+        weightmap_f.close()
+        segmap_f.close()
+
     except Exception as e:
         logger.error(f"Error processing galaxy {idx} in tile {tilename}: {str(e)}")
 
@@ -124,15 +134,10 @@ def process_tile(tile):
 
     # Select galaxies
     cat, sample = select_sample(tilename, plot=False)
-
-    # Open files and load data into memory
-    tile_f = fits.open(f'/scratch/tile_{tilename}.fits')
-    weightmap_f = fits.open(f'/scratch/wht_{tilename}.fits')
-    segmap_f = fits.open(f'/scratch/seg_{tilename}.fits')
     
     # Prepare arguments for parallel galaxy processing
     galaxy_args = [
-        (idx, row, tilename, tile_f, weightmap_f, segmap_f)
+        (idx, row, tilename)
         for idx, row in sample.iterrows()
     ]
     
@@ -140,11 +145,6 @@ def process_tile(tile):
     n_cores = max(1, cpu_count() - 1)
     with Pool(n_cores) as pool:
         results = pool.map(process_galaxy, galaxy_args)
-    
-    # Close files immediately
-    tile_f.close()
-    weightmap_f.close()
-    segmap_f.close()
 
     # Record that this tile is done
     with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:

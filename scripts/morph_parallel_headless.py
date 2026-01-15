@@ -173,6 +173,7 @@ if __name__ == '__main__':
     # parallel_processing()
     # update please
 
+    tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
     process_tile(tile_df.iloc[0])
 
 

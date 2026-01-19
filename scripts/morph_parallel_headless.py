@@ -167,9 +167,9 @@ if __name__ == '__main__':
 
     # Load tile list
     tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
-    # done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
-    # done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
-    # tile_df = tile_df[~tile_df.tile.isin(done.tile)]
+    done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
+    done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
+    tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
     # Process each tile sequentially
     for i, tile in enumerate(tile_df.tile.values):

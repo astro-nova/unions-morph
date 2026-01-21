@@ -4,6 +4,7 @@ warnings.filterwarnings('ignore')
 import os
 os.environ['PYTHONWARNINGS'] = 'ignore'
 
+import argparse
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -174,11 +175,18 @@ def process_tile(tile):
 
 if __name__ == '__main__':
 
+    # Parse input args: imin, imax to index tile df using argparse
+    parser = argparse.ArgumentParser(description='Process tiles for morphology analysis.')
+    parser.add_argument('--imin', type=int, required=True,  help='Minimum index of tiles to process')
+    parser.add_argument('--imax', type=int, required=True,  help='Maximum index of tiles to process')
+    args = parser.parse_args()
+
     # Load tile list
     tile_df = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/tiles_r.csv')
-    done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
-    done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
-    tile_df = tile_df[~tile_df.tile.isin(done.tile)]
+    tile_df = tile_df.iloc[args.imin:args.imax]
+    # done = pd.read_csv('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', names=['coords'])
+    # done['tile'] = 'CFIS_LSB.' + np.char.mod('%07.3f', done.coords.values).astype(str) + '.r'
+    # tile_df = tile_df[~tile_df.tile.isin(done.tile)]
 
     # Process each tile sequentially
     for i, tile in enumerate(tile_df.tile.values):

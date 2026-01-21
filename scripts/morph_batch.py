@@ -13,6 +13,9 @@ image = "images.canfar.net/skaha/astroflow:latest"
 project="/arc/home/esazonova/unions-morph"
 # data_path = f"{project}/data/{datetime.now().strftime('%Y%m%d')}"
 
+imin = 146
+imax = 166
+
 # Or submit fixed job (guaranteed resources by specifying cores/ram)
 job_ids = session.create(
     name=job_name,

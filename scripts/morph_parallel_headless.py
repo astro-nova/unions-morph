@@ -143,18 +143,9 @@ def process_tile(tile):
         ]
         
         # Process galaxies in parallel
-        # n_cores = max(1, cpu_count() - 1)
-        # with Pool(n_cores) as pool:
-        #     results = pool.map(process_galaxy, galaxy_args)
-
+        n_cores = max(1, cpu_count() - 1)
         with Pool(n_cores) as pool:
-            results = list(
-                tqdm(
-                    pool.imap_unordered(process_galaxy, galaxy_args),
-                    total=len(galaxy_args),
-                    desc=f"Processing galaxies for {tile}"
-                )
-            )
+            results = pool.map(process_galaxy, galaxy_args)
 
         # Record that this tile is done
         with open('/arc/home/esazonova/unions-morph/catalogs/processed_tiles_new.csv', 'a') as f:

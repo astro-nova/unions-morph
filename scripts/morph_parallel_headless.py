@@ -182,4 +182,4 @@ if __name__ == '__main__':
 
     # Process each tile sequentially
     for i, tile in enumerate(tile_df.tile.values):
-        process_tile(tile, fileid)
+        process_tile(tile, args.fileid)

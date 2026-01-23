@@ -107,7 +107,7 @@ def process_galaxy(args):
         res = parse_morph(res, morph)
 
         # Write result to file immediately
-        out_file = '/arc/home/esazonova/unions-morph/catalogs/morph_batch2.csv'
+        out_file = '/arc/home/esazonova/unions-morph/catalogs/morph_batch3.csv'
         with open(out_file, 'a') as f:
             # If filesize is 0 write header
             if f.tell() == 0:

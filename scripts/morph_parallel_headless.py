@@ -78,7 +78,7 @@ def select_sample(tile, plot=False):
 
 def process_galaxy(args):
     """Process a single galaxy from a tile"""
-    idx, row, tilename = args
+    idx, row, tilename, fileid = args
     try:
         
         # Open files and load data into memory
@@ -107,7 +107,7 @@ def process_galaxy(args):
         res = parse_morph(res, morph)
 
         # Write result to file immediately
-        out_file = '/arc/home/esazonova/unions-morph/catalogs/morph_batch3.csv'
+        out_file = f'/arc/home/esazonova/unions-morph/catalogs/morph_batch{fileid}.csv'
         with open(out_file, 'a') as f:
             # If filesize is 0 write header
             if f.tell() == 0:
@@ -124,7 +124,7 @@ def process_galaxy(args):
         logger.error(f"Error processing galaxy {idx} in tile {tilename}: {str(e)}")
 
 
-def process_tile(tile):
+def process_tile(tile, fileid):
 
     try:
         print(f'Processing tile {tile}')
@@ -138,7 +138,7 @@ def process_tile(tile):
         
         # Prepare arguments for parallel galaxy processing
         galaxy_args = [
-            (idx, row, tilename)
+            (idx, row, tilename, fileid)
             for idx, row in sample.iterrows()
         ]
         
@@ -170,6 +170,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process tiles for morphology analysis.')
     parser.add_argument('--imin', type=int, required=True,  help='Minimum index of tiles to process')
     parser.add_argument('--imax', type=int, required=True,  help='Maximum index of tiles to process')
+    parser.add_argument('--fileid', type=int, required=True,  help='File ID for output')
     args = parser.parse_args()
 
     # Load tile list
@@ -181,4 +182,4 @@ if __name__ == '__main__':
 
     # Process each tile sequentially
     for i, tile in enumerate(tile_df.tile.values):
-        process_tile(tile)
+        process_tile(tile, fileid)

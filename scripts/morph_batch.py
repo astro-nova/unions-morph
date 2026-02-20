@@ -13,17 +13,18 @@ image = "images.canfar.net/skaha/astroflow:latest"
 project="/arc/home/esazonova/unions-morph"
 # data_path = f"{project}/data/{datetime.now().strftime('%Y%m%d')}"
 
-imin = 146
-imax = 166
+imin = 2166
+imax = 2186
+fileid = 20
 
 # Or submit fixed job (guaranteed resources by specifying cores/ram)
 job_ids = session.create(
     name=job_name,
     image=image,
     cores=16,
-    ram=64,  # Having cores/ram makes it a fixed session
+    ram=16,  # Having cores/ram makes it a fixed session
     cmd="python",
-    args=f"{project}/scripts/morph_parallel_headless.py"
+    args=f"{project}/scripts/morph_parallel_headless.py --imin {imin} --imax {imax} --fileid {fileid}",
 )
 
 print(f"Submitted job(s): {job_ids}")

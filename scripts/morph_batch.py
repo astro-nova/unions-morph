@@ -3,6 +3,9 @@
 # Script to run `morph_parallel.py` in headless mode on CANFAR
 from canfar.sessions import Session
 from datetime import datetime
+from multiprocessing import cpu_count
+import os 
+
 
 # Initialize session manager
 session = Session()
@@ -13,9 +16,9 @@ image = "images.canfar.net/skaha/astroflow:latest"
 project="/arc/home/esazonova/unions-morph"
 # data_path = f"{project}/data/{datetime.now().strftime('%Y%m%d')}"
 
-imin = 2166
-imax = 2186
-fileid = 20
+imin = 3450
+imax = 3500
+fileid = 28
 
 # Or submit fixed job (guaranteed resources by specifying cores/ram)
 job_ids = session.create(

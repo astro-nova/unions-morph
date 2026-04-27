@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
@@ -53,8 +54,10 @@ def _log_prob_fn(flow, x, c):
 
 @eqx.filter_jit
 def _latent_fn(flow, x, c):
-    z, _ = flow.bijection.inverse_and_log_det(x, condition=c)
-    return z
+    def single(x_i, c_i):
+        z, _ = flow.bijection.inverse_and_log_det(x_i, condition=c_i)
+        return z
+    return jax.vmap(single)(x, c)
 
 
 class ConditionalFlow:

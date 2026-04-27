@@ -75,7 +75,7 @@ class FlowDataset:
             if self.n_subset is not None:
                 n_total = f[self.feature_path.format(name=self.feature_names[0])].shape[0]
                 rng = np.random.default_rng(self.seed)
-                subset_idx = rng.choice(n_total, size=self.n_subset, replace=False)
+                subset_idx = np.sort(rng.choice(n_total, size=self.n_subset, replace=False))
             else:
                 subset_idx = slice(None)
  

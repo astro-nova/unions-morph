@@ -43,7 +43,7 @@ class FlowDataset:
         *,
         feature_path: str = "training/{name}",
         mask_path: str = "masks/mask_{name}",
-        cond_path: str = "conditioning/{name}",
+        cond_path: str = "condition/{name}",
         standardize_continuous_cond: bool = True,
         val_frac: float = 0.1,
         n_subset: int = None,

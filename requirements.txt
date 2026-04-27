@@ -1,0 +1,18 @@
+# Core numerical / imaging — lower bounds match statmorph-lsst's own requirements
+numpy>=1.14.0
+scipy>=0.19
+scikit-image>=0.25.2
+astropy>=2.0
+photutils>=2.0
+
+# Everything else imported under scripts/ and lib/
+pandas
+matplotlib
+tqdm
+psutil
+joblib
+vos
+
+# statmorph-lsst is installed separately from its GitHub checkout
+# (pip install -e $PROJECT_DIR/src/statmorph-lsst) and must NOT be listed here:
+# it is not in the Alliance wheelhouse, so `pip install --no-index` would fail.

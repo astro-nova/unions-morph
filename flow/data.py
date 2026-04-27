@@ -22,7 +22,7 @@ import h5py
 import numpy as np
 
 
-DEFAULT_COND_VARS = ("r_mag", "psf_fwhm", "sky_median", "sky_sigma", "snr")
+DEFAULT_COND_VARS = ("mag_ellip", "fwhm", "sky_median", "sky_sigma", "sn_per_pixel")
 
 
 class FlowDataset:
@@ -41,11 +41,12 @@ class FlowDataset:
         masked_feature_names: Optional[Sequence[str]] = None,
         cond_var_names: Sequence[str] = DEFAULT_COND_VARS,
         *,
-        feature_path: str = "features/{name}",
-        mask_path: str = "masks/{name}",
+        feature_path: str = "training/{name}",
+        mask_path: str = "masks/mask_{name}",
         cond_path: str = "conditioning/{name}",
         standardize_continuous_cond: bool = True,
-        val_frac: float = 0.05,
+        val_frac: float = 0.1,
+        n_subset: int = None,
         seed: int = 0,
     ):
         self.data_path = data_path
@@ -57,6 +58,7 @@ class FlowDataset:
         self.cond_path = cond_path
         self.standardize_continuous_cond = standardize_continuous_cond
         self.val_frac = val_frac
+        self.n_subset = n_subset
         self.seed = seed
 
         self._load()
@@ -69,19 +71,27 @@ class FlowDataset:
         with h5py.File(self.data_path, "r") as f:
             stored_masks = set(self.masked_feature_names)
 
+            # if self.n_subset is not None, only draw a random subset of the data
+            if self.n_subset is not None:
+                n_total = f[self.feature_path.format(name=self.feature_names[0])].shape[0]
+                rng = np.random.default_rng(self.seed)
+                subset_idx = rng.choice(n_total, size=self.n_subset, replace=False)
+            else:
+                subset_idx = slice(None)
+ 
             for name in self.feature_names:
-                feats.append(f[self.feature_path.format(name=name)][:])
+                feats.append(f[self.feature_path.format(name=name)][subset_idx])
             n = feats[0].shape[0]
 
             for name in self.feature_names:
                 if name in stored_masks:
-                    m = f[self.mask_path.format(name=name)][:]
+                    m = f[self.mask_path.format(name=name)][subset_idx]
                 else:
                     m = np.zeros(n, dtype=np.uint8)
                 masks.append(m.astype(np.float32))
 
             for name in self.cond_var_names:
-                cond.append(f[self.cond_path.format(name=name)][:])
+                cond.append(f[self.cond_path.format(name=name)][subset_idx])
 
         self.x         = np.stack(feats, axis=1).astype(np.float32)
         self.mask      = np.stack(masks, axis=1).astype(np.float32)

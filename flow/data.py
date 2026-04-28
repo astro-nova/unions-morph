@@ -76,8 +76,10 @@ class FlowDataset:
                 n_total = f[self.feature_path.format(name=self.feature_names[0])].shape[0]
                 rng = np.random.default_rng(self.seed)
                 subset_idx = np.sort(rng.choice(n_total, size=self.n_subset, replace=False))
+                self.subset_idx = subset_idx
             else:
                 subset_idx = slice(None)
+                self.subset_idx = None
  
             for name in self.feature_names:
                 feats.append(f[self.feature_path.format(name=name)][:][subset_idx])

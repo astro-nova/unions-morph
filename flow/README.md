@@ -48,6 +48,70 @@ lr 1e-3, 5 epochs).
 - **Model**: flowjax `coupling_flow` with `RationalQuadraticSpline(knots=8, interval=10)`,
   10 coupling layers, MLP conditioner 256x3.
 
+## Hyperparameters
+
+All model and training knobs are constructor kwargs on `ConditionalFlow`.
+
+### Architecture
+
+| param | default | what it controls |
+|-------|---------|------------------|
+| `n_features` | — | dim of `x`. Match `ds.n_features`. |
+| `n_cond` | — | dim of `c`. Match `ds.n_cond`. |
+| `n_coupling_layers` | 10 | number of coupling blocks. Each block transforms one half of `x` conditional on the other half + `c`, alternating. |
+| `n_bins` | 8 | knots per rational-quadratic spline. Sets per-feature 1D expressiveness. |
+| `spline_bound` | 10.0 | RQ spline support is `[-bound, bound]`; identity outside. |
+| `nn_width` | 256 | hidden units in the conditioner MLP. |
+| `nn_depth` | 3 | hidden layers in the conditioner MLP. |
+
+- **`n_coupling_layers`** — capacity for cross-feature dependence. Too few →
+  residual off-diagonal structure in `corrcoef(z.T)` and pairwise z scatter.
+  Train time grows roughly linearly. 10–14 is typical for ~50-d structured data.
+- **`n_bins`** — capacity for sharp 1D structure (narrow modes, boundary
+  pile-up, heavy tails). Too few → specific `z[:, i]` marginals stay
+  non-Gaussian even after the loss has flattened. Cheap to bump first (8 → 12).
+- **`spline_bound`** — anything pushed past `[-bound, bound]` is mapped by the
+  identity, so set it larger than the data range. Features are pre-scaled into
+  (-10, 10), so the default puts the boundary right at the data edge; 12 or 15
+  buys slack at no parameter cost.
+- **`nn_width` / `nn_depth`** — how richly `c` modulates the spline parameters.
+  Symptom of too small: marginal `z` is Gaussian but `z`-sliced-by-`c` is not.
+  Width helps with many interacting conditioners; depth with non-linear
+  effects. 256×3 is mid-range; 512×3 is the next step up.
+
+### Training
+
+| param | default | what it controls |
+|-------|---------|------------------|
+| `batch_size` | 8192 | examples per gradient step. |
+| `learning_rate` | 1e-3 | Adam step size. |
+| `n_epochs` | 5 | full passes over the training set. |
+| `grad_clip` | 1.0 | max global grad norm; guards against bad-batch blowups. |
+| `seed` | 0 | RNG for parameter init and shuffle order. |
+
+- **`batch_size`** — larger = smoother gradients and better GPU throughput,
+  fewer updates per epoch. Does not change what is learnable. Push as far as
+  memory allows; 16k–64k is reasonable for 100M sources.
+- **`learning_rate`** — too high → loss is twitchy or NaN; too low → slow.
+  Larger batches usually tolerate higher lr. Drop to 5e-4 / 3e-4 if late
+  training looks noisy.
+- **`n_epochs`** — with ~100M sources, 2–3 is often enough. Stop adding when
+  `epoch_val_loss` flattens.
+- **`grad_clip`** — 1.0 is conservative and safe. Lower only if you see
+  occasional huge loss spikes despite a sensible learning rate.
+
+### Tuning by symptom
+
+- Marginal `z[:, i]` non-Gaussian for some `i` → bump `n_bins`; check
+  `spline_bound`; first rule out feature-level issues (mask-induced spikes,
+  edge pile-up).
+- Off-diagonal correlations in `z` → more `n_coupling_layers`.
+- Conditional `z | c`-slice non-Gaussian (marginals fine but slicing by `c`
+  shifts/widens) → wider / deeper conditioner.
+- Loss noisy or NaN → lower `learning_rate`, lower `grad_clip`.
+- Loss flattens slowly → larger `batch_size` with proportionally higher
+  `learning_rate`, or more epochs.
+
 ## Adapt to your HDF5
 
 Override the path templates if needed:

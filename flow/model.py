@@ -60,6 +60,52 @@ def _latent_fn(flow, x, c):
     return jax.vmap(single)(x, c)
 
 
+@eqx.filter_jit
+def _split_logp_fn(flow, x, c):
+    def single(x_i, c_i):
+        z, log_det = flow.bijection.inverse_and_log_det(x_i, condition=c_i)
+        log_pz = flow.base_dist.log_prob(z)
+        return log_pz, log_det
+    return jax.vmap(single)(x, c)
+
+
+@eqx.filter_jit
+def _score_fn(flow, x, c):
+    def single_lp(x_i, c_i):
+        return flow.log_prob(x_i, condition=c_i)
+    return jax.vmap(jax.grad(single_lp))(x, c)
+
+
+@eqx.filter_jit
+def _jac_fn(flow, x, c):
+    def single(x_i, c_i):
+        z, _ = flow.bijection.inverse_and_log_det(x_i, condition=c_i)
+        return z
+    return jax.vmap(jax.jacfwd(single))(x, c)
+
+
+@eqx.filter_jit
+def _walk_fn(flow, x, c, u, alphas):
+    def walk_one(x_i, c_i):
+        z_i, _ = flow.bijection.inverse_and_log_det(x_i, condition=c_i)
+        zs = z_i[None, :] + alphas[:, None] * u[None, :]
+        xs = jax.vmap(lambda z: flow.bijection.transform(z, condition=c_i))(zs)
+        return xs, zs
+    return jax.vmap(walk_one)(x, c)
+
+
+@eqx.filter_jit
+def _local_axis_fn(flow, x, c, u):
+    def single(x_i, c_i):
+        z, _ = flow.bijection.inverse_and_log_det(x_i, condition=c_i)
+        return z
+    Js = jax.vmap(jax.jacfwd(single))(x, c)
+    vs = jax.vmap(lambda J: jnp.linalg.solve(J, u))(Js)
+    norms = jnp.linalg.norm(vs, axis=1)
+    safe = jnp.where(norms > 0, norms, 1.0)
+    return vs / safe[:, None], norms
+
+
 class ConditionalFlow:
     """Conditional normalizing flow over `n_features` dims, conditioned on `n_cond`."""
 
@@ -287,6 +333,145 @@ class ConditionalFlow:
             out[pos:pos + n] = np.asarray(zb)
             pos += n
         return out
+
+    # --------------------------------------------------------------- jacobian diagnostics
+    def split_log_prob(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        *,
+        batch_size: Optional[int] = None,
+        progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Decompose log p(x|c) = log_pz(z) + log|det J_{x→z}|. Returns two `(N,)` arrays."""
+        n = x.shape[0]
+        log_pz = np.empty(n, dtype=np.float32)
+        log_det = np.empty(n, dtype=np.float32)
+        bs = batch_size or self.batch_size
+        rng = np.random.default_rng(0)
+        n_steps = (n + bs - 1) // bs
+        it = self._iter_batches(x, c, shuffle=False, rng=rng, batch_size=bs)
+        if progress and tqdm is not None:
+            it = tqdm(it, total=n_steps, desc="split_log_prob")
+        pos = 0
+        for xb, cb in it:
+            lpz, ld = _split_logp_fn(self.flow, xb, cb)
+            k = lpz.shape[0]
+            log_pz[pos:pos + k] = np.asarray(lpz)
+            log_det[pos:pos + k] = np.asarray(ld)
+            pos += k
+        return log_pz, log_det
+
+    def score(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        *,
+        batch_size: Optional[int] = None,
+        progress: bool = False,
+    ) -> np.ndarray:
+        """∇_x log p(x|c). Returns `(N, n_features)`. Norm is a useful outlier signal."""
+        n, f = x.shape
+        out = np.empty((n, f), dtype=np.float32)
+        bs = batch_size or self.batch_size
+        rng = np.random.default_rng(0)
+        n_steps = (n + bs - 1) // bs
+        it = self._iter_batches(x, c, shuffle=False, rng=rng, batch_size=bs)
+        if progress and tqdm is not None:
+            it = tqdm(it, total=n_steps, desc="score")
+        pos = 0
+        for xb, cb in it:
+            s = _score_fn(self.flow, xb, cb)
+            k = s.shape[0]
+            out[pos:pos + k] = np.asarray(s)
+            pos += k
+        return out
+
+    def jacobian(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        *,
+        batch_size: Optional[int] = None,
+        progress: bool = False,
+    ) -> np.ndarray:
+        """∂z/∂x. Returns `(N, n_features, n_features)`. Memory ~ N·F²·4 bytes."""
+        n, f = x.shape
+        bs = batch_size or 256
+        out = np.empty((n, f, f), dtype=np.float32)
+        rng = np.random.default_rng(0)
+        n_steps = (n + bs - 1) // bs
+        it = self._iter_batches(x, c, shuffle=False, rng=rng, batch_size=bs)
+        if progress and tqdm is not None:
+            it = tqdm(it, total=n_steps, desc="jacobian")
+        pos = 0
+        for xb, cb in it:
+            J = _jac_fn(self.flow, xb, cb)
+            k = J.shape[0]
+            out[pos:pos + k] = np.asarray(J)
+            pos += k
+        return out
+
+    def walk_axis(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        u: np.ndarray,
+        alphas: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Walk seed sources along unit vector `u` in latent space.
+
+        For each seed `i`: z_i = f(x_i, c_i), then z_i + α u for each α, mapped
+        back to data space (with the seed's own conditioning held fixed).
+
+        Args:
+            x:      (N, F) seed sources.
+            c:      (N, n_cond) seed conditioning.
+            u:      (F,) latent-space direction (typically unit-norm).
+            alphas: (K,) step sizes.
+
+        Returns:
+            xs: (N, K, F) walked sources in data space.
+            zs: (N, K, F) walked points in latent space.
+        """
+        u = jnp.asarray(u, dtype=jnp.float32)
+        alphas = jnp.asarray(alphas, dtype=jnp.float32)
+        xs, zs = _walk_fn(self.flow, jnp.asarray(x), jnp.asarray(c), u, alphas)
+        return np.asarray(xs), np.asarray(zs)
+
+    def local_axis_in_x(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        u: np.ndarray,
+        *,
+        batch_size: Optional[int] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Local feature-space direction corresponding to latent vector `u`.
+
+        v(x_i) = J(x_i)^{-1} u, returned normalized to unit length, plus the
+        pre-normalization length ‖J^{-1} u‖. Small length means a unit step in
+        z costs little in x — the source sits on a steep part of the axis;
+        large length means the axis is flat there.
+
+        Returns:
+            v:    (N, F) unit vectors.
+            cost: (N,)   ‖J(x_i)^{-1} u‖ before normalization.
+        """
+        u = jnp.asarray(u, dtype=jnp.float32)
+        n, f = x.shape
+        bs = batch_size or 256
+        v = np.empty((n, f), dtype=np.float32)
+        cost = np.empty(n, dtype=np.float32)
+        rng = np.random.default_rng(0)
+        pos = 0
+        for xb, cb in self._iter_batches(x, c, shuffle=False, rng=rng, batch_size=bs):
+            vb, nb = _local_axis_fn(self.flow, xb, cb, u)
+            k = vb.shape[0]
+            v[pos:pos + k] = np.asarray(vb)
+            cost[pos:pos + k] = np.asarray(nb)
+            pos += k
+        return v, cost
 
     # --------------------------------------------------------------- I/O
     def save(self, path: str | Path):

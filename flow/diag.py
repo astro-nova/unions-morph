@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
+import matplotlib.pyplot as plt
 
 
 def _unwrap(flow):
@@ -169,6 +170,159 @@ def per_feature_anomaly_score(flow, x, c, *, n_samples=200, batch_size=64, seed=
 
     z_feat = ((x - mu) / np.where(sd > 0, sd, 1.0)).astype(np.float32)
     return z_feat, mu, sd
+
+
+# ============================================================
+# Latent-space axes: late→early (or any labeled gradient)
+# ============================================================
+# Workflow:
+#   z = model.transform(x, c)
+#   u, s = fit_axis_in_z(z, label)                # direction in z
+#   plot_axis_vs_label(s, label)                  # is the axis real?
+#   xs, _ = model.walk_axis(seeds_x, seeds_c, u, alphas)
+#   plot_axis_walk(model, seeds_x, seeds_c, u, alphas, feature_names)
+#   v, cost = model.local_axis_in_x(x, c, u)      # per-source x-direction
+#   plot_axis_loadings(u, v.mean(0), feature_names)
+# ============================================================
+
+def fit_axis_in_z(z, label, *, method="ridge", alpha=1.0):
+    """Find a unit direction `u` in latent space that tracks `label`.
+
+    Args:
+        z:      (N, D) latent codes (from `model.transform`).
+        label:  (N,) continuous (e.g. T-type) or binary (0/1).
+        method: "ridge" for continuous labels, "lda" for binary.
+        alpha:  ridge regularization (ignored for lda).
+
+    Returns:
+        u:     (D,) unit vector in z-space.
+        score: (N,) projection `z @ u`.
+    """
+    z = np.asarray(z)
+    label = np.asarray(label)
+    if method == "ridge":
+        from sklearn.linear_model import Ridge
+        u = Ridge(alpha=alpha).fit(z, label).coef_.astype(np.float32)
+    elif method == "lda":
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        u = LinearDiscriminantAnalysis().fit(z, label).coef_[0].astype(np.float32)
+    else:
+        raise ValueError(f"unknown method {method!r}")
+    n = float(np.linalg.norm(u))
+    if n == 0:
+        raise ValueError("fitted axis has zero norm")
+    u = u / n
+    return u, z @ u
+
+
+def plot_axis_vs_label(score, label, ax=None, *, label_name="label", gridsize=50):
+    """Hexbin of axis projection vs label, annotated with Pearson r."""
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5, 4))
+    label = np.asarray(label)
+    score = np.asarray(score)
+    ax.hexbin(label, score, gridsize=gridsize, mincnt=1, cmap="viridis")
+    r = float(np.corrcoef(label, score)[0, 1])
+    ax.set_xlabel(label_name)
+    ax.set_ylabel("z · u  (axis projection)")
+    ax.set_title(f"axis vs {label_name}   (r = {r:.3f})")
+    return ax
+
+
+def plot_axis_walk(model, x_seeds, c_seeds, u, alphas, feature_names,
+                   ax=None, *, kind="heatmap", center=True):
+    """Walk seeds along `u` in z, plot mean walked features vs α.
+
+    `kind="heatmap"` shows a feature × α image of mean walked x (recommended
+    for ~50 features). `kind="lines"` overlays one line per feature.
+    `center=True` subtracts the value at α≈0 so the panel shows change rather
+    than absolute level.
+    """
+    xs, _ = model.walk_axis(x_seeds, c_seeds, u, alphas)        # (N, K, F)
+    mean_x = xs.mean(axis=0)                                    # (K, F)
+    alphas = np.asarray(alphas)
+    if center:
+        zero_idx = int(np.argmin(np.abs(alphas)))
+        mean_x = mean_x - mean_x[zero_idx]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, max(4, 0.18 * len(feature_names))))
+
+    if kind == "heatmap":
+        vmax = float(np.max(np.abs(mean_x))) or 1.0
+        im = ax.imshow(
+            mean_x.T, aspect="auto", cmap="RdBu_r",
+            vmin=-vmax, vmax=vmax,
+            extent=[alphas[0], alphas[-1], len(feature_names) - 0.5, -0.5],
+        )
+        ax.set_yticks(np.arange(len(feature_names)))
+        ax.set_yticklabels(feature_names, fontsize=7)
+        ax.set_xlabel("α  (steps along u in z)")
+        ax.set_title("synthetic walk: Δ⟨x⟩ along axis" if center else "⟨x⟩ along walk")
+        plt.colorbar(im, ax=ax, label=("Δ⟨x⟩" if center else "⟨x⟩"))
+    elif kind == "lines":
+        for j, name in enumerate(feature_names):
+            ax.plot(alphas, mean_x[:, j], label=name, lw=1)
+        ax.axhline(0, color="k", lw=0.5, alpha=0.5)
+        ax.set_xlabel("α")
+        ax.set_ylabel("⟨x⟩ along walk" + (" (centered)" if center else ""))
+        if len(feature_names) <= 20:
+            ax.legend(fontsize=7, ncol=2)
+    else:
+        raise ValueError(f"unknown kind {kind!r}")
+    return ax
+
+
+def plot_axis_loadings(u, v_mean, feature_names, axes=None, *, top_k=15):
+    """Two panels: latent-space `u` (all dims) and top-|v_mean| feature loadings.
+
+    `v_mean` is the mean over sources of `model.local_axis_in_x(...)[0]` —
+    i.e. the average local feature-space direction corresponding to `u`.
+    """
+    u = np.asarray(u)
+    v_mean = np.asarray(v_mean)
+    top_k = min(top_k, len(feature_names))
+    if axes is None:
+        _, axes = plt.subplots(1, 2, figsize=(12, max(4, 0.3 * top_k)))
+
+    axes[0].bar(np.arange(len(u)), u)
+    axes[0].axhline(0, color="k", lw=0.5)
+    axes[0].set_xlabel("latent dim")
+    axes[0].set_ylabel("u_i")
+    axes[0].set_title("axis direction in z")
+
+    order = np.argsort(-np.abs(v_mean))[:top_k]
+    axes[1].barh(np.arange(top_k), v_mean[order][::-1])
+    axes[1].set_yticks(np.arange(top_k))
+    axes[1].set_yticklabels([feature_names[j] for j in order][::-1], fontsize=8)
+    axes[1].axvline(0, color="k", lw=0.5)
+    axes[1].set_xlabel("⟨v_j⟩  (mean local x-direction)")
+    axes[1].set_title(f"top {top_k} features driving the axis")
+    return axes
+
+
+def plot_logp_decomposition(log_pz, log_det, ax=None, *, label=None,
+                            label_name="label", gridsize=60):
+    """Scatter of `log p_z` vs `log|det J|` from `model.split_log_prob`.
+
+    Without a label, hexbin density. With a label, per-source scatter colored
+    by it — useful for spotting where late- vs early-type galaxies live in
+    the (latent term, Jacobian term) plane.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 5))
+    log_pz = np.asarray(log_pz)
+    log_det = np.asarray(log_det)
+    if label is None:
+        ax.hexbin(log_pz, log_det, gridsize=gridsize, mincnt=1, cmap="viridis")
+    else:
+        sc = ax.scatter(log_pz, log_det, c=np.asarray(label), s=4,
+                        cmap="coolwarm", alpha=0.6)
+        plt.colorbar(sc, ax=ax, label=label_name)
+    ax.set_xlabel("log p_z(z)   (latent term)")
+    ax.set_ylabel("log|det J_{x→z}|   (Jacobian term)")
+    ax.set_title("log p(x|c) decomposition")
+    return ax
 
 
 def report_top_anomalous_features(z_feat, x, mu, sd, feature_names,

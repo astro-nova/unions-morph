@@ -3,6 +3,12 @@ import jax.numpy as jnp
 import numpy as np
 from functools import partial
 
+
+def _unwrap(flow):
+    """Accept either a flowjax distribution or a ConditionalFlow wrapper."""
+    return getattr(flow, "flow", flow)
+
+
 # ============================================================
 # Version 1: Gradient-based attribution
 # ============================================================
@@ -14,9 +20,11 @@ from functools import partial
 
 def make_gradient_attribution_fn(flow):
     """
-    flow: a flowjax distribution with .log_prob(x, condition=c)
+    flow: a flowjax distribution (or ConditionalFlow wrapper) with .log_prob(x, condition=c)
     Returns a jit-compiled function mapping (x_batch, c_batch) -> (N, D) attributions.
     """
+    flow = _unwrap(flow)
+
     def log_prob_single(x, c):
         # log_prob expects batched input; add/remove batch dim
         return flow.log_prob(x[None, :], condition=c[None, :])[0]
@@ -54,21 +62,21 @@ def make_gradient_attribution_fn(flow):
 def make_latent_attribution_fn(flow):
     """
     Returns functions to:
-      (a) compute per-latent log-density contributions
+      (a) compute per-latent log-density contributions (returns (z, contribs))
       (b) attribute them back to input features via Jacobian
     """
+    flow = _unwrap(flow)
+
     def forward_single(x, c):
         # Map x -> z under the conditional flow.
-        # flowjax bijections expose a .transform method; adapt as needed
-        # for your specific flow object (some use flow.bijection.transform).
-        z = flow.bijection.transform(x, condition=c)
-        return z
+        return flow.bijection.transform(x, condition=c)
 
     def latent_logp_contrib_single(x, c):
         z = forward_single(x, c)
         # Per-dim contribution to log p_z under standard normal base
         # -0.5 * z_i^2 - 0.5 * log(2*pi)
-        return -0.5 * z**2 - 0.5 * jnp.log(2.0 * jnp.pi)  # (D,)
+        contribs = -0.5 * z**2 - 0.5 * jnp.log(2.0 * jnp.pi)  # (D,)
+        return z, contribs
 
     batched_latent_contrib = jax.jit(jax.vmap(latent_logp_contrib_single, in_axes=(0, 0)))
 
@@ -94,19 +102,12 @@ def feature_attribution_from_latent(x_batch, c_batch, latent_contrib_fn, jac_fn)
       latent_contrib: (N, D) per-latent log-density values
       jacobians:      (N, D, D) full Jacobian dz/dx for diagnostics
     """
-    latent_contrib = latent_contrib_fn(x_batch, c_batch)  # (N, D)
-    jacobians = jac_fn(x_batch, c_batch)                   # (N, D_z, D_x)
-
-    # We need z to weight the rows of the Jacobian
-    # Recompute z (cheap; or refactor to return it from latent_contrib_fn)
-    def fwd(x, c):
-        return flow.bijection.transform(x, condition=c)
-    z_batch = jax.vmap(fwd)(x_batch, c_batch)              # (N, D)
+    z_batch, latent_contrib = latent_contrib_fn(x_batch, c_batch)  # (N, D), (N, D)
+    jacobians = jac_fn(x_batch, c_batch)                            # (N, D_z, D_x)
 
     # d(log p_z)/d(x_j) = sum_i (-z_i) * dz_i/dx_j
-    # Shape: (N, D_x) = einsum over i
     dlogpz_dx = -jnp.einsum('ni,nij->nj', z_batch, jacobians)
 
-    feature_attrib = x_batch * dlogpz_dx                   # input * grad
+    feature_attrib = x_batch * dlogpz_dx                            # input * grad
     return feature_attrib, latent_contrib, jacobians
 

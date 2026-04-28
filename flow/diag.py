@@ -155,7 +155,7 @@ def per_feature_anomaly_score(flow, x, c, *, n_samples=200, batch_size=64, seed=
 
     batched_sample = jax.jit(jax.vmap(sample_one, in_axes=(0, 0)))
 
-    rng = jax.random.PRNGKey(seed)
+    rng = jax.random.key(seed)
     mu = np.empty((N, D), dtype=np.float32)
     sd = np.empty((N, D), dtype=np.float32)
 

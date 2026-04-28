@@ -100,3 +100,40 @@ def feature_attribution_from_latent(x_batch, c_batch, latent_contrib_fn, jac_fn)
     # We need z to weight the rows of the Jacobian
     # Recompute z (cheap; or refactor to return it from latent_contrib_fn)
     def fwd(x, c):
+        return flow.bijection.transform(x, condition=c)
+    z_batch = jax.vmap(fwd)(x_batch, c_batch)              # (N, D)
+
+    # d(log p_z)/d(x_j) = sum_i (-z_i) * dz_i/dx_j
+    # Shape: (N, D_x) = einsum over i
+    dlogpz_dx = -jnp.einsum('ni,nij->nj', z_batch, jacobians)
+
+    feature_attrib = x_batch * dlogpz_dx                   # input * grad
+    return feature_attrib, latent_contrib, jacobians
+
+
+# ============================================================
+# Usage
+# ============================================================
+
+# Suppose you have:
+#   flow:    your trained flowjax conditional flow
+#   x_sub:   (N, 51) subsample features, jnp.array
+#   c_sub:   (N, 5)  conditioning vars, jnp.array
+
+# --- Quick attribution (recommended starting point) ---
+attribution_fn = make_gradient_attribution_fn(flow)
+attrib = attribution_fn(x_sub, c_sub)            # (N, 51)
+attrib_np = np.asarray(attrib)
+
+# Now attrib_np[i, j] = how much feature j contributes to log p for galaxy i.
+# Negative values = feature is pulling likelihood down (anomalous).
+# To rank "which features made this galaxy weird":
+worst_features_per_galaxy = np.argsort(attrib_np, axis=1)[:, :5]  # 5 most negative
+
+# --- Full latent decomposition (for deeper analysis) ---
+latent_contrib_fn, jac_fn = make_latent_attribution_fn(flow)
+feat_attr, lat_contrib, jacs = feature_attribution_from_latent(
+    x_sub, c_sub, latent_contrib_fn, jac_fn
+)
+# feat_attr: (N, 51)  — per-feature contribution to base-dist log-density
+# lat_contrib: (N, 51) — per-*latent* log-density (use to find which z_i is in tail)

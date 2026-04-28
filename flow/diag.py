@@ -111,3 +111,88 @@ def feature_attribution_from_latent(x_batch, c_batch, latent_contrib_fn, jac_fn)
     feature_attrib = x_batch * dlogpz_dx                            # input * grad
     return feature_attrib, latent_contrib, jacobians
 
+
+# ============================================================
+# Version 3: Per-feature conditional z-score (Monte Carlo)
+# ============================================================
+# For each source i and feature j:
+#   mu_ij = E[x_j | c_i],  sd_ij = std[x_j | c_i]   (estimated by MC)
+#   z_feat_ij = (x_ij - mu_ij) / sd_ij
+#
+# This answers "is feature j unusual on source i, given its observing
+# conditions" without the input-magnitude bias of input*grad. Sign tells
+# you whether x_j is above or below typical; magnitude is in conditional
+# sigmas, so it is comparable across features.
+#
+# Cost: n_samples flow.sample calls per source. Use on a subset, not all
+# 100M sources.
+# ============================================================
+
+def per_feature_anomaly_score(flow, x, c, *, n_samples=200, batch_size=64, seed=0):
+    """
+    Per-feature conditional z-score via Monte Carlo from p(x | c).
+
+    Args:
+        flow:        ConditionalFlow wrapper or flowjax distribution.
+        x:           (N, D) features for the subset to inspect.
+        c:           (N, n_cond) conditioning (already standardized like training).
+        n_samples:   MC draws per source for estimating mu/sd of p(x_j | c_i).
+        batch_size:  number of sources processed per JIT batch (memory control).
+        seed:        PRNG seed.
+
+    Returns:
+        z_feat: (N, D) per-feature conditional z-scores.
+        mu:     (N, D) conditional means E[x_j | c_i].
+        sd:     (N, D) conditional stds  std[x_j | c_i].
+    """
+    flow = _unwrap(flow)
+    x = np.asarray(x)
+    c = np.asarray(c)
+    N, D = x.shape
+
+    def sample_one(key, c_i):
+        return flow.sample(key, (n_samples,), condition=c_i)   # (K, D)
+
+    batched_sample = jax.jit(jax.vmap(sample_one, in_axes=(0, 0)))
+
+    rng = jax.random.PRNGKey(seed)
+    mu = np.empty((N, D), dtype=np.float32)
+    sd = np.empty((N, D), dtype=np.float32)
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        rng, sub = jax.random.split(rng)
+        keys = jax.random.split(sub, end - start)
+        samples = batched_sample(keys, jnp.asarray(c[start:end]))  # (B, K, D)
+        mu[start:end] = np.asarray(samples.mean(axis=1))
+        sd[start:end] = np.asarray(samples.std(axis=1))
+
+    z_feat = ((x - mu) / np.where(sd > 0, sd, 1.0)).astype(np.float32)
+    return z_feat, mu, sd
+
+
+def report_top_anomalous_features(z_feat, x, mu, sd, feature_names,
+                                  source_idx, top_k=5):
+    """
+    Print, for each source in `source_idx`, the top-k features ranked by
+    |conditional z-score|, alongside the actual x value and the conditional
+    typical range (mu ± sd).
+
+    Args:
+        z_feat:        (N, D) from per_feature_anomaly_score.
+        x:             (N, D) features.
+        mu, sd:        (N, D) from per_feature_anomaly_score.
+        feature_names: list of D strings.
+        source_idx:    iterable of row indices to inspect.
+        top_k:         number of features to print per source.
+    """
+    name_w = max(8, max(len(n) for n in feature_names))
+    for i in source_idx:
+        order = np.argsort(-np.abs(z_feat[i]))[:top_k]
+        print(f"\nsource {i}:")
+        print(f"  {'feature':<{name_w}}  {'x':>9}  {'mu(c)':>9}  "
+              f"{'sd(c)':>8}  {'z_feat':>8}")
+        for j in order:
+            print(f"  {feature_names[j]:<{name_w}}  "
+                  f"{x[i, j]:>9.3f}  {mu[i, j]:>9.3f}  "
+                  f"{sd[i, j]:>8.3f}  {z_feat[i, j]:>+8.2f}")

@@ -80,18 +80,18 @@ class FlowDataset:
                 subset_idx = slice(None)
  
             for name in self.feature_names:
-                feats.append(f[self.feature_path.format(name=name)][subset_idx])
+                feats.append(f[self.feature_path.format(name=name)][:][subset_idx])
             n = feats[0].shape[0]
 
             for name in self.feature_names:
                 if name in stored_masks:
-                    m = f[self.mask_path.format(name=name)][subset_idx]
+                    m = f[self.mask_path.format(name=name)][:][subset_idx]
                 else:
                     m = np.zeros(n, dtype=np.uint8)
                 masks.append(m.astype(np.float32))
 
             for name in self.cond_var_names:
-                cond.append(f[self.cond_path.format(name=name)][subset_idx])
+                cond.append(f[self.cond_path.format(name=name)][:][subset_idx])
 
         self.x         = np.stack(feats, axis=1).astype(np.float32)
         self.mask      = np.stack(masks, axis=1).astype(np.float32)

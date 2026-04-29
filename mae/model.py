@@ -24,6 +24,13 @@ Training:
     standard MAE / BERT-style denoising objective. This forces the latent
     code to capture cross-feature structure rather than collapse to identity.
 
+    Loss options (`loss_type`):
+      - 'mse' : plain squared error on μ. Decoder out-dim = F.
+      - 'nll' : Gaussian NLL with predicted log σ² per feature.
+                Decoder out-dim = 2F (μ, log σ²); log σ² clipped to [-7, 7].
+                Anomaly scoring then supports 'mahalanobis' = (x−μ)²/σ² and
+                'nll' = 0.5(sq/σ² + log σ²) in addition to plain 'mse'.
+
 The conditioning `c` (typically the 5 standardized observing-condition vars,
 brightness first) modulates every hidden activation through FiLM:
 
@@ -117,16 +124,33 @@ class _Decoder(eqx.Module):
         return self.head(h)
 
 
+_LOG_VAR_CLIP = 7.0  # clip log σ² to [-7, 7] for NLL stability
+
+
 class _MAEModule(eqx.Module):
     encoder: _Encoder
     decoder: _Decoder
+    loss_type: str = eqx.field(static=True)
+    n_features: int = eqx.field(static=True)
+
+    def split_output(self, out):
+        """Split decoder output into (mu, log_var). For mse, log_var is zeros."""
+        if self.loss_type == "nll":
+            mu = out[:self.n_features]
+            log_var = jnp.clip(out[self.n_features:], -_LOG_VAR_CLIP, _LOG_VAR_CLIP)
+        else:
+            mu = out
+            log_var = jnp.zeros_like(out)
+        return mu, log_var
 
 
 # ---------------------------------------------------------------- jitted kernels
 def _forward_single(model, x_i, m_i, c_i):
     x_in = x_i * (1.0 - m_i)
     z = model.encoder(x_in, m_i, c_i)
-    return model.decoder(z, c_i), z
+    out = model.decoder(z, c_i)
+    mu, log_var = model.split_output(out)
+    return mu, log_var, z
 
 
 @eqx.filter_jit
@@ -135,13 +159,18 @@ def _loss_fn(model, x, m_orig, c, key, mask_ratio):
     m_total = jnp.maximum(m_orig, m_extra)
 
     def fwd(x_i, m_i, c_i):
-        x_hat, _ = _forward_single(model, x_i, m_i, c_i)
-        return x_hat
+        mu, log_var, _ = _forward_single(model, x_i, m_i, c_i)
+        return mu, log_var
 
-    x_hat = jax.vmap(fwd)(x, m_total, c)
+    mu, log_var = jax.vmap(fwd)(x, m_total, c)
     loss_mask = m_extra * (1.0 - m_orig)        # artificially-hidden & originally-observed
-    sq = (x_hat - x) ** 2
-    return (sq * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+    sq = (mu - x) ** 2
+    if model.loss_type == "nll":
+        # 0.5 * ((x-μ)² / σ² + log σ²); constant 0.5*log(2π) dropped.
+        per_elem = 0.5 * (sq * jnp.exp(-log_var) + log_var)
+    else:
+        per_elem = sq
+    return (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
 
 
 @eqx.filter_jit
@@ -160,36 +189,56 @@ def _encode_fn(model, x, m, c):
     return jax.vmap(per_row)(x, m, c)
 
 
+def _per_elem_score(sq, log_var, score_type):
+    """Per-element score: 'mse' = sq; 'mahalanobis' = sq/σ²; 'nll' = 0.5(sq/σ² + log σ²)."""
+    if score_type == "mahalanobis":
+        return sq * jnp.exp(-log_var)
+    if score_type == "nll":
+        return 0.5 * (sq * jnp.exp(-log_var) + log_var)
+    return sq
+
+
 @eqx.filter_jit
 def _reconstruct_fn(model, x, m, c):
     def per_row(x_i, m_i, c_i):
-        x_hat, _ = _forward_single(model, x_i, m_i, c_i)
-        return x_hat
+        mu, _, _ = _forward_single(model, x_i, m_i, c_i)
+        return mu
     return jax.vmap(per_row)(x, m, c)
 
 
 @eqx.filter_jit
-def _self_recon_err_fn(model, x, m, c):
-    """Per-source MSE on originally-observed positions (no extra masking)."""
+def _predict_fn(model, x, m, c):
+    """Per-row (mu, log_var). For loss_type='mse', log_var is zeros."""
     def per_row(x_i, m_i, c_i):
-        x_hat, _ = _forward_single(model, x_i, m_i, c_i)
-        sq = (x_hat - x_i) ** 2
-        obs = 1.0 - m_i
-        return (sq * obs).sum() / jnp.clip(obs.sum(), 1.0, None)
+        mu, lv, _ = _forward_single(model, x_i, m_i, c_i)
+        return mu, lv
     return jax.vmap(per_row)(x, m, c)
 
 
 @eqx.filter_jit
-def _mc_recon_err_fn(model, x, m, c, key, mask_ratio):
-    """Per-source MSE on positions we artificially hide (one MC draw)."""
+def _self_recon_err_fn(model, x, m, c, score_type):
+    """Per-source error on originally-observed positions (no extra masking)."""
+    def per_row(x_i, m_i, c_i):
+        mu, log_var, _ = _forward_single(model, x_i, m_i, c_i)
+        sq = (mu - x_i) ** 2
+        per_elem = _per_elem_score(sq, log_var, score_type)
+        obs = 1.0 - m_i
+        return (per_elem * obs).sum() / jnp.clip(obs.sum(), 1.0, None)
+    return jax.vmap(per_row)(x, m, c)
+
+
+@eqx.filter_jit
+def _mc_recon_err_fn(model, x, m, c, key, mask_ratio, score_type):
+    """Per-source error on positions we artificially hide (one MC draw)."""
     m_extra = (jr.uniform(key, x.shape) < mask_ratio).astype(x.dtype)
     m_total = jnp.maximum(m, m_extra)
 
     def per_row(x_i, m_total_i, m_extra_i, m_orig_i, c_i):
-        x_hat, _ = _forward_single(model, x_i, m_total_i, c_i)
+        mu, log_var, _ = _forward_single(model, x_i, m_total_i, c_i)
         loss_mask = m_extra_i * (1.0 - m_orig_i)
-        sq = (x_hat - x_i) ** 2
-        return (sq * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+        sq = (mu - x_i) ** 2
+        per_elem = _per_elem_score(sq, log_var, score_type)
+        return (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
 
     return jax.vmap(per_row)(x, m_total, m_extra, m, c)
 
@@ -206,8 +255,8 @@ def _per_feature_loo_fn(model, x, m, c):
     def per_row(x_i, m_orig_i, c_i):
         def mask_j(j_onehot):
             m_total = jnp.maximum(m_orig_i, j_onehot)
-            x_hat, _ = _forward_single(model, x_i, m_total, c_i)
-            return x_hat
+            mu, _, _ = _forward_single(model, x_i, m_total, c_i)
+            return mu
         x_hats = jax.vmap(mask_j)(eye)        # (F, F)
         return jnp.diagonal(x_hats)           # (F,)
 
@@ -233,8 +282,11 @@ class MaskedAutoencoder:
         learning_rate: float = 1e-3,
         n_epochs: int = 10,
         grad_clip: float = 1.0,
+        loss_type: str = "mse",
         seed: int = 0,
     ):
+        if loss_type not in ("mse", "nll"):
+            raise ValueError(f"loss_type must be 'mse' or 'nll', got {loss_type!r}")
         self.n_features = n_features
         self.n_cond = n_cond
         self.latent_dim = latent_dim
@@ -245,6 +297,7 @@ class MaskedAutoencoder:
         self.learning_rate = learning_rate
         self.n_epochs = n_epochs
         self.grad_clip = grad_clip
+        self.loss_type = loss_type
         self.seed = seed
 
         self.history: dict = {}
@@ -261,15 +314,21 @@ class MaskedAutoencoder:
             cond_dim=self.n_cond,
             key=ke,
         )
+        dec_out = 2 * self.n_features if self.loss_type == "nll" else self.n_features
         decoder = _Decoder(
             latent=self.latent_dim,
             hidden=self.hidden_dim,
             depth=self.n_hidden_layers,
-            out_dim=self.n_features,
+            out_dim=dec_out,
             cond_dim=self.n_cond,
             key=kd,
         )
-        self.model = _MAEModule(encoder=encoder, decoder=decoder)
+        self.model = _MAEModule(
+            encoder=encoder,
+            decoder=decoder,
+            loss_type=self.loss_type,
+            n_features=self.n_features,
+        )
 
     # ----------------------------------------------------------------- batching
     def _iter_batches(self, x, m, c, *, shuffle, rng, batch_size=None):
@@ -466,6 +525,7 @@ class MaskedAutoencoder:
         mask: np.ndarray,
         c: np.ndarray,
         *,
+        score_type: str = "mse",
         mc_seeds: int = 0,
         mask_ratio: Optional[float] = None,
         batch_size: Optional[int] = None,
@@ -474,17 +534,34 @@ class MaskedAutoencoder:
     ) -> np.ndarray:
         """Per-source reconstruction-error score. Higher = more anomalous.
 
-        Two modes:
-          - `mc_seeds=0` (default): self-reconstruction MSE on the originally
-            observed positions, no extra masking. Cheapest; risk is that the
-            bottleneck partly identity-bypasses high-information features.
+        `score_type`:
+          - 'mse'         : raw squared error (μ − x)². Always available.
+          - 'mahalanobis' : (μ − x)² / σ². Down-weights features the model
+                            knows are noisy. Requires `loss_type='nll'`.
+          - 'nll'         : 0.5 * ((μ − x)² / σ² + log σ²). The training
+                            objective itself. Requires `loss_type='nll'`.
+
+        Two MC modes:
+          - `mc_seeds=0` (default): scored on originally observed positions,
+            no extra masking. Cheapest; risk is that the bottleneck partly
+            identity-bypasses high-information features.
           - `mc_seeds>0`: averages over `mc_seeds` random masking draws at
-            `mask_ratio` (defaults to the training value). MSE measured only
-            on artificially hidden, originally observed positions. Closer to
+            `mask_ratio` (defaults to the training value). Scored only on
+            artificially hidden, originally observed positions. Closer to
             the training objective; more robust to identity bypass.
 
         Returns `(N,)` numpy array.
         """
+        if score_type not in ("mse", "mahalanobis", "nll"):
+            raise ValueError(
+                f"score_type must be 'mse', 'mahalanobis', or 'nll'; got {score_type!r}"
+            )
+        if score_type != "mse" and self.loss_type != "nll":
+            raise ValueError(
+                f"score_type={score_type!r} requires loss_type='nll' "
+                f"(model has loss_type={self.loss_type!r}); σ² is not learned."
+            )
+
         bs = batch_size or self.batch_size
         n_steps = (x.shape[0] + bs - 1) // bs
         rng = np.random.default_rng(0)
@@ -497,7 +574,7 @@ class MaskedAutoencoder:
         if mc_seeds <= 0:
             pos = 0
             for xb, mb, cb in it:
-                eb = _self_recon_err_fn(self.model, xb, mb, cb)
+                eb = _self_recon_err_fn(self.model, xb, mb, cb, score_type)
                 n = eb.shape[0]
                 out[pos:pos + n] = np.asarray(eb)
                 pos += n
@@ -509,7 +586,9 @@ class MaskedAutoencoder:
                 acc = jnp.zeros(xb.shape[0], dtype=jnp.float32)
                 for _ in range(mc_seeds):
                     key, sub = jr.split(key)
-                    acc = acc + _mc_recon_err_fn(self.model, xb, mb, cb, sub, mr)
+                    acc = acc + _mc_recon_err_fn(
+                        self.model, xb, mb, cb, sub, mr, score_type
+                    )
                 eb = acc / mc_seeds
                 n = eb.shape[0]
                 out[pos:pos + n] = np.asarray(eb)

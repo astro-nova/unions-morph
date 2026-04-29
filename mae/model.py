@@ -39,12 +39,26 @@ brightness first) modulates every hidden activation through FiLM:
 i.e. a per-channel affine transform whose scale and shift are linear in `c`.
 At init, γ ≈ 0 / β ≈ 0 (small LeCun init on the FiLM head), so the network
 starts as a plain MLP and learns brightness modulation gradually.
+
+Optional adversarial disentanglement (`adv_lambda > 0`):
+    A small MLP head predicts (a subset of) `c` from `z`. A gradient-reversal
+    layer flips the sign of gradients flowing back into the encoder, so the
+    encoder is pushed to make `z` *unpredictive* of the targeted condition
+    vars while the head simultaneously learns to be a good predictor.
+
+      total_loss = recon_loss + ‖adv_head(GRL(z, λ)) − c[:, target_dims]‖²
+
+    The strength λ is ramped linearly from 0 to `adv_lambda` over
+    `adv_warmup_steps` global steps, so the head becomes a competent
+    predictor before its gradient meaningfully shapes `z`. `adv_target_dims`
+    chooses which columns of `c` to push out of `z` (default: all of `c`).
+    Set `adv_lambda=0` (the default) to disable entirely.
 """
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import jax
@@ -82,6 +96,43 @@ class FiLMBlock(eqx.Module):
         gamma, beta = gb[:self.out_dim], gb[self.out_dim:]
         h = (1.0 + gamma) * h + beta
         return jax.nn.gelu(h)
+
+
+@jax.custom_vjp
+def _grad_reverse(x, lam):
+    """Identity in forward; in backward, multiplies the cotangent by `-lam`.
+
+    Used to push the encoder to produce `z` that's hard to predict `c` from,
+    while still letting the adversary head learn to be a good predictor.
+    """
+    return x
+
+def _gr_fwd(x, lam):
+    return x, lam
+
+def _gr_bwd(res, g):
+    lam = res
+    return (-lam * g, jnp.zeros_like(lam))
+
+_grad_reverse.defvjp(_gr_fwd, _gr_bwd)
+
+
+class _AdvHead(eqx.Module):
+    """Small MLP that predicts (a subset of) `c` from `z`. No FiLM; sees only `z`."""
+    layers: list
+
+    def __init__(self, latent: int, hidden: int, n_target: int, *, key):
+        keys = jr.split(key, 3)
+        self.layers = [
+            eqx.nn.Linear(latent, hidden, key=keys[0]),
+            eqx.nn.Linear(hidden, hidden, key=keys[1]),
+            eqx.nn.Linear(hidden, n_target, key=keys[2]),
+        ]
+
+    def __call__(self, z):
+        h = jax.nn.gelu(self.layers[0](z))
+        h = jax.nn.gelu(self.layers[1](h))
+        return self.layers[2](h)
 
 
 class _Encoder(eqx.Module):
@@ -130,8 +181,12 @@ _LOG_VAR_CLIP = 7.0  # clip log σ² to [-7, 7] for NLL stability
 class _MAEModule(eqx.Module):
     encoder: _Encoder
     decoder: _Decoder
+    adv_head: Optional[_AdvHead]
     loss_type: str = eqx.field(static=True)
     n_features: int = eqx.field(static=True)
+    adv_lambda: float = eqx.field(static=True)
+    adv_warmup_steps: int = eqx.field(static=True)
+    adv_target_dims: tuple = eqx.field(static=True)
 
     def split_output(self, out):
         """Split decoder output into (mu, log_var). For mse, log_var is zeros."""
@@ -153,16 +208,16 @@ def _forward_single(model, x_i, m_i, c_i):
     return mu, log_var, z
 
 
-@eqx.filter_jit
-def _loss_fn(model, x, m_orig, c, key, mask_ratio):
+def _recon_and_z(model, x, m_orig, c, key, mask_ratio):
+    """Shared kernel: artificial masking + forward + recon loss. Returns (recon_loss, z)."""
     m_extra = (jr.uniform(key, x.shape) < mask_ratio).astype(x.dtype)
     m_total = jnp.maximum(m_orig, m_extra)
 
     def fwd(x_i, m_i, c_i):
-        mu, log_var, _ = _forward_single(model, x_i, m_i, c_i)
-        return mu, log_var
+        mu, log_var, z = _forward_single(model, x_i, m_i, c_i)
+        return mu, log_var, z
 
-    mu, log_var = jax.vmap(fwd)(x, m_total, c)
+    mu, log_var, z = jax.vmap(fwd)(x, m_total, c)
     loss_mask = m_extra * (1.0 - m_orig)        # artificially-hidden & originally-observed
     sq = (mu - x) ** 2
     if model.loss_type == "nll":
@@ -170,15 +225,51 @@ def _loss_fn(model, x, m_orig, c, key, mask_ratio):
         per_elem = 0.5 * (sq * jnp.exp(-log_var) + log_var)
     else:
         per_elem = sq
-    return (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+    recon = (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+    return recon, z
 
 
 @eqx.filter_jit
-def _step_fn(model, opt_state, x, m, c, key, mask_ratio, optimizer):
-    loss, grads = eqx.filter_value_and_grad(_loss_fn)(model, x, m, c, key, mask_ratio)
+def _loss_fn(model, x, m_orig, c, key, mask_ratio, step):
+    """Total loss = recon_loss + adv_loss (adversary pushed via gradient reversal).
+
+    `step` is a JAX scalar (current global step) used to ramp the adversarial
+    weight linearly from 0 to `model.adv_lambda` over `model.adv_warmup_steps`.
+    Returns (total_loss, (recon_loss, adv_loss)) for use with `has_aux=True`.
+    """
+    recon, z = _recon_and_z(model, x, m_orig, c, key, mask_ratio)
+
+    if model.adv_head is not None:
+        target_idx = jnp.array(model.adv_target_dims, dtype=jnp.int32)
+        c_target = c[:, target_idx]
+        warmup = jnp.maximum(model.adv_warmup_steps, 1).astype(jnp.float32)
+        ramp = jnp.minimum(1.0, step.astype(jnp.float32) / warmup)
+        lam = model.adv_lambda * ramp
+        z_grl = _grad_reverse(z, lam)
+        c_pred = jax.vmap(model.adv_head)(z_grl)
+        adv = jnp.mean((c_pred - c_target) ** 2)
+        total = recon + adv
+    else:
+        adv = jnp.array(0.0)
+        total = recon
+    return total, (recon, adv)
+
+
+@eqx.filter_jit
+def _val_loss_fn(model, x, m_orig, c, key, mask_ratio):
+    """Validation: recon loss only (the metric we actually care about)."""
+    recon, _ = _recon_and_z(model, x, m_orig, c, key, mask_ratio)
+    return recon
+
+
+@eqx.filter_jit
+def _step_fn(model, opt_state, x, m, c, key, mask_ratio, step, optimizer):
+    (loss, aux), grads = eqx.filter_value_and_grad(_loss_fn, has_aux=True)(
+        model, x, m, c, key, mask_ratio, step
+    )
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss
+    return model, opt_state, loss, aux
 
 
 @eqx.filter_jit
@@ -283,10 +374,25 @@ class MaskedAutoencoder:
         n_epochs: int = 10,
         grad_clip: float = 1.0,
         loss_type: str = "mse",
+        # adversarial disentanglement (off when adv_lambda == 0)
+        adv_lambda: float = 0.0,
+        adv_target_dims: Optional[Sequence[int]] = None,
+        adv_hidden: int = 64,
+        adv_warmup_steps: int = 1000,
         seed: int = 0,
     ):
         if loss_type not in ("mse", "nll"):
             raise ValueError(f"loss_type must be 'mse' or 'nll', got {loss_type!r}")
+        if adv_lambda < 0:
+            raise ValueError(f"adv_lambda must be ≥ 0, got {adv_lambda!r}")
+        if adv_warmup_steps < 0:
+            raise ValueError(f"adv_warmup_steps must be ≥ 0, got {adv_warmup_steps!r}")
+        if adv_target_dims is not None:
+            for d in adv_target_dims:
+                if not (0 <= int(d) < n_cond):
+                    raise ValueError(
+                        f"adv_target_dims contains {d!r}, must be in [0, {n_cond})"
+                    )
         self.n_features = n_features
         self.n_cond = n_cond
         self.latent_dim = latent_dim
@@ -298,6 +404,12 @@ class MaskedAutoencoder:
         self.n_epochs = n_epochs
         self.grad_clip = grad_clip
         self.loss_type = loss_type
+        self.adv_lambda = float(adv_lambda)
+        self.adv_target_dims = (
+            None if adv_target_dims is None else tuple(int(d) for d in adv_target_dims)
+        )
+        self.adv_hidden = int(adv_hidden)
+        self.adv_warmup_steps = int(adv_warmup_steps)
         self.seed = seed
 
         self.history: dict = {}
@@ -305,7 +417,7 @@ class MaskedAutoencoder:
 
     def _build(self):
         key = jr.PRNGKey(self.seed)
-        ke, kd = jr.split(key)
+        ke, kd, ka = jr.split(key, 3)
         encoder = _Encoder(
             in_dim=2 * self.n_features,        # [x_in | mask]
             hidden=self.hidden_dim,
@@ -323,11 +435,33 @@ class MaskedAutoencoder:
             cond_dim=self.n_cond,
             key=kd,
         )
+
+        if self.adv_lambda > 0.0:
+            target_dims = (
+                tuple(range(self.n_cond))
+                if self.adv_target_dims is None
+                else self.adv_target_dims
+            )
+            adv_head = _AdvHead(
+                latent=self.latent_dim,
+                hidden=self.adv_hidden,
+                n_target=len(target_dims),
+                key=ka,
+            )
+        else:
+            target_dims = ()
+            adv_head = None
+        self._adv_target_dims_resolved = target_dims  # for inspection
+
         self.model = _MAEModule(
             encoder=encoder,
             decoder=decoder,
+            adv_head=adv_head,
             loss_type=self.loss_type,
             n_features=self.n_features,
+            adv_lambda=self.adv_lambda,
+            adv_warmup_steps=self.adv_warmup_steps,
+            adv_target_dims=target_dims,
         )
 
     # ----------------------------------------------------------------- batching
@@ -388,9 +522,14 @@ class MaskedAutoencoder:
         if ckpt_dir is not None:
             ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        adv_on = self.model.adv_head is not None
         history = {
             "step_loss": [],
+            "step_recon_loss": [],
+            "step_adv_loss": [],
             "epoch_train_loss": [],
+            "epoch_recon_loss": [],
+            "epoch_adv_loss": [],
             "epoch_val_loss": [],
             "epoch_time": [],
             "best_val_loss": float("inf"),
@@ -402,10 +541,13 @@ class MaskedAutoencoder:
         use_tqdm = progress and tqdm is not None
         epoch_bar = tqdm(range(self.n_epochs), desc="epoch") if use_tqdm else range(self.n_epochs)
 
+        global_step = 0
         for epoch in epoch_bar:
             t0 = time.time()
 
             train_losses = []
+            recon_losses = []
+            adv_losses = []
             step_iter = self._iter_batches(x, mask, c, shuffle=True, rng=rng)
             if use_tqdm:
                 step_iter = tqdm(step_iter, total=n_steps_per_epoch,
@@ -413,19 +555,32 @@ class MaskedAutoencoder:
 
             for step_i, (xb, mb, cb) in enumerate(step_iter):
                 key, sub = jr.split(key)
-                self.model, opt_state, loss = _step_fn(
-                    self.model, opt_state, xb, mb, cb, sub, self.mask_ratio, optimizer
+                step_arr = jnp.asarray(global_step, dtype=jnp.float32)
+                self.model, opt_state, loss, aux = _step_fn(
+                    self.model, opt_state, xb, mb, cb, sub,
+                    self.mask_ratio, step_arr, optimizer,
                 )
+                global_step += 1
                 lf = float(loss)
+                rf = float(aux[0])
+                af = float(aux[1])
                 train_losses.append(lf)
+                recon_losses.append(rf)
+                adv_losses.append(af)
                 history["step_loss"].append(lf)
+                history["step_recon_loss"].append(rf)
+                history["step_adv_loss"].append(af)
 
                 if use_tqdm:
                     recent = train_losses[-50:]
-                    step_iter.set_postfix(loss=f"{lf:.4f}",
-                                          mean=f"{np.mean(recent):.4f}")
+                    postfix = {"loss": f"{lf:.4f}", "mean": f"{np.mean(recent):.4f}"}
+                    if adv_on:
+                        postfix["recon"] = f"{rf:.4f}"
+                        postfix["adv"] = f"{af:.4f}"
+                    step_iter.set_postfix(**postfix)
                 if log_every and step_i % log_every == 0:
-                    print(f"  epoch {epoch} step {step_i:6d} loss={lf:.4f}")
+                    extra = f" recon={rf:.4f} adv={af:.4f}" if adv_on else ""
+                    print(f"  epoch {epoch} step {step_i:6d} loss={lf:.4f}{extra}")
 
             val_l = float("nan")
             if has_val:
@@ -434,8 +589,8 @@ class MaskedAutoencoder:
                 for xb, mb, cb in self._iter_batches(val_x, val_mask, val_c,
                                                      shuffle=False, rng=rng):
                     vsub, kk = jr.split(vsub)
-                    val_losses.append(float(_loss_fn(self.model, xb, mb, cb,
-                                                     kk, self.mask_ratio)))
+                    val_losses.append(float(_val_loss_fn(self.model, xb, mb, cb,
+                                                         kk, self.mask_ratio)))
                 val_l = float(np.mean(val_losses))
                 history["epoch_val_loss"].append(val_l)
                 if val_l < history["best_val_loss"]:
@@ -443,17 +598,26 @@ class MaskedAutoencoder:
                     history["best_epoch"] = epoch
 
             train_l = float(np.mean(train_losses))
+            recon_l = float(np.mean(recon_losses))
+            adv_l = float(np.mean(adv_losses))
             dt = time.time() - t0
             history["epoch_train_loss"].append(train_l)
+            history["epoch_recon_loss"].append(recon_l)
+            history["epoch_adv_loss"].append(adv_l)
             history["epoch_time"].append(dt)
 
             if use_tqdm:
                 postfix = {"train": f"{train_l:.4f}", "dt": f"{dt:.1f}s"}
+                if adv_on:
+                    postfix["recon"] = f"{recon_l:.4f}"
+                    postfix["adv"] = f"{adv_l:.4f}"
                 if has_val:
                     postfix["val"] = f"{val_l:.4f}"
                 epoch_bar.set_postfix(**postfix)
             else:
                 msg = f"epoch {epoch}: train={train_l:.4f}"
+                if adv_on:
+                    msg += f"  recon={recon_l:.4f}  adv={adv_l:.4f}"
                 if has_val:
                     msg += f"  val={val_l:.4f}"
                 msg += f"  ({dt:.1f}s)"

@@ -465,6 +465,70 @@ class MaskedAutoencoder:
         self.history = history
         return self
 
+    # --------------------------------------------------------------- baseline loss
+    def loss_of(
+        self,
+        y_pred: np.ndarray,
+        x: np.ndarray,
+        mask: np.ndarray,
+        *,
+        log_var: Optional[np.ndarray] = None,
+        mask_ratio: Optional[float] = None,
+        n_draws: int = 10,
+        seed: int = 0,
+    ) -> float:
+        """Training-objective loss for an arbitrary `y_pred` against `x`.
+
+        Same masking scheme as the training loss: averages over positions that
+        are artificially hidden (Bernoulli(`mask_ratio`)) AND originally observed
+        (catalog `mask` = 0). Numbers are directly comparable to
+        `history['epoch_val_loss']`.
+
+        `y_pred` may be `(F,)` (broadcasts over rows — useful for
+        median/mean baselines) or `(N, F)`.
+
+        For `loss_type='nll'`, `log_var` defaults to zero (σ²=1) — i.e. unit-
+        variance Gaussian NLL, which equals 0.5 * MSE up to a constant. Pass
+        an explicit `log_var` array if you want to score a non-trivial
+        uncertainty prediction.
+
+        Averages over `n_draws` random mask realizations to reduce variance.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        mask = np.asarray(mask, dtype=np.float32)
+        if x.shape != mask.shape:
+            raise ValueError(f"x {x.shape} and mask {mask.shape} must match")
+        if x.shape[1] != self.n_features:
+            raise ValueError(f"x has {x.shape[1]} features, expected {self.n_features}")
+
+        y_pred = np.broadcast_to(
+            np.asarray(y_pred, dtype=np.float32), x.shape
+        )
+
+        sq = (y_pred - x) ** 2
+        if self.loss_type == "nll":
+            if log_var is None:
+                lv = np.zeros_like(x)
+            else:
+                lv = np.broadcast_to(
+                    np.asarray(log_var, dtype=np.float32), x.shape
+                )
+                lv = np.clip(lv, -_LOG_VAR_CLIP, _LOG_VAR_CLIP)
+            per_elem = 0.5 * (sq * np.exp(-lv) + lv)
+        else:
+            per_elem = sq
+
+        mr = self.mask_ratio if mask_ratio is None else mask_ratio
+        rng = np.random.default_rng(seed)
+        obs = 1.0 - mask
+        losses = np.empty(n_draws, dtype=np.float64)
+        for k in range(n_draws):
+            m_extra = (rng.random(x.shape) < mr).astype(np.float32)
+            loss_mask = m_extra * obs
+            denom = max(loss_mask.sum(), 1.0)
+            losses[k] = (per_elem * loss_mask).sum() / denom
+        return float(losses.mean())
+
     # --------------------------------------------------------------- inference
     def encode(
         self,

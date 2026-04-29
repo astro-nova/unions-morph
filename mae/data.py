@@ -33,7 +33,7 @@ DEFAULT_COND_VARS = ("mag_ellip", "fwhm", "sky_median", "sky_sigma", "sn_per_pix
 class MAEDataset:
     """Load `(x, mask, c)` from HDF5 for the MAE.
 
-    `x`     : (N, F)  continuous features, expected pre-scaled to ~(-10, 10).
+    `x`     : (N, F)  continuous features, robust-scaled per column.
     `mask`  : (N, F)  binary; 1 where the value was imputed / bad.
     `c`     : (N, K)  continuous conditioning vars (standardized in place).
     """
@@ -49,6 +49,7 @@ class MAEDataset:
         mask_path: str = "masks/mask_{name}",
         cond_path: str = "condition/{name}",
         standardize_continuous_cond: bool = True,
+        normalize_features: bool = True,
         val_frac: float = 0.1,
         n_subset: Optional[int] = None,
         seed: int = 0,
@@ -61,6 +62,7 @@ class MAEDataset:
         self.mask_path = mask_path
         self.cond_path = cond_path
         self.standardize_continuous_cond = standardize_continuous_cond
+        self.normalize_features = normalize_features
         self.val_frac = val_frac
         self.n_subset = n_subset
         self.seed = seed
@@ -106,6 +108,25 @@ class MAEDataset:
             raise ValueError(f"{(~np.isfinite(self.x)).sum()} non-finite values in x")
         if not np.isfinite(self.c).all():
             raise ValueError(f"{(~np.isfinite(self.c)).sum()} non-finite values in c")
+
+        if self.normalize_features:
+            f_dim = self.x.shape[1]
+            self.feat_median = np.zeros(f_dim, dtype=np.float32)
+            self.feat_iqr    = np.ones(f_dim,  dtype=np.float32)
+            valid = self.mask < 0.5
+            for j in range(f_dim):
+                col = self.x[valid[:, j], j]
+                if col.size == 0:
+                    continue
+                med = np.median(col)
+                p5, p95 = np.percentile(col, [5, 95])
+                self.feat_median[j] = med
+                self.feat_iqr[j]    = max(float(p95 - p5), 1e-8)
+            self.x = ((self.x - self.feat_median) / self.feat_iqr).astype(np.float32)
+        else:
+            f_dim = self.x.shape[1]
+            self.feat_median = np.zeros(f_dim, dtype=np.float32)
+            self.feat_iqr    = np.ones(f_dim,  dtype=np.float32)
 
         if self.standardize_continuous_cond:
             self.cond_mu = self.c.mean(axis=0)

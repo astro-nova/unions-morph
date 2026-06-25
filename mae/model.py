@@ -6,6 +6,7 @@ Single-class sklearn-style API:
     model.train(x_tr, m_tr, c_tr, val_x=x_va, val_mask=m_va, val_c=c_va)
     z         = model.encode(x, m, c)              # (N, latent_dim)
     x_hat     = model.reconstruct(x, m, c)         # (N, n_features)
+    x_hat     = model.decode(z, c)                 # (N, n_features) from z + c
     score     = model.anomaly_score(x, m, c)       # (N,)
     per_feat  = model.per_feature_anomaly(x, m, c) # (N, n_features)
     model.save("ckpt.eqx")
@@ -354,6 +355,15 @@ def _encode_fn(model, x, m, c):
     def per_row(x_i, m_i, c_i):
         return _encode_single(model, x_i, m_i, _zeros_like_mask(m_i), c_i)
     return jax.vmap(per_row)(x, m, c)
+
+
+@eqx.filter_jit
+def _decode_fn(model, z, c):
+    """Decode latent codes `z` straight through the decoder (encoder skipped)."""
+    def per_row(z_i, c_i):
+        e = model.conditioner(c_i)
+        return model.decoder(z_i, e)
+    return jax.vmap(per_row)(z, c)
 
 
 @eqx.filter_jit
@@ -817,6 +827,49 @@ class MaskedAutoencoder:
             n = xh.shape[0]
             out[pos:pos + n] = np.asarray(xh)
             pos += n
+        return out
+
+    def decode(
+        self,
+        z: np.ndarray,
+        c: np.ndarray,
+        *,
+        batch_size: Optional[int] = None,
+        progress: bool = False,
+    ) -> np.ndarray:
+        """Reconstruct `x_hat` from latent codes `z` and conditioning `c`.
+
+        The inverse-direction counterpart of `encode`: runs the decoder only
+        (encoder skipped), so it works on arbitrary points in latent space —
+        e.g. interpolations, samples, or `z` perturbed for counterfactuals.
+        Conditioning `c` is FiLM-applied exactly as in the full forward pass.
+
+        Returns `(N, n_features)`.
+        """
+        z = np.asarray(z, dtype=np.float32)
+        c = np.asarray(c, dtype=np.float32)
+        if z.ndim != 2 or z.shape[1] != self.latent_dim:
+            raise ValueError(
+                f"z must be (N, {self.latent_dim}), got {z.shape}"
+            )
+        if c.ndim != 2 or c.shape[1] != self.n_cond:
+            raise ValueError(f"c must be (N, {self.n_cond}), got {c.shape}")
+        if z.shape[0] != c.shape[0]:
+            raise ValueError(
+                f"z, c row-count mismatch: {z.shape[0]} / {c.shape[0]}"
+            )
+
+        out = np.empty((z.shape[0], self.n_features), dtype=np.float32)
+        bs = batch_size or self.batch_size
+        n_steps = (z.shape[0] + bs - 1) // bs
+        it = range(0, z.shape[0], bs)
+        if progress and tqdm is not None:
+            it = tqdm(it, total=n_steps, desc="decode")
+        for i in it:
+            zb = jnp.asarray(z[i:i + bs])
+            cb = jnp.asarray(c[i:i + bs])
+            xh = _decode_fn(self.model, zb, cb)
+            out[i:i + xh.shape[0]] = np.asarray(xh)
         return out
 
     def anomaly_score(

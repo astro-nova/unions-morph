@@ -12,17 +12,31 @@ Single-class sklearn-style API:
     MaskedAutoencoder(n_features=51, n_cond=5).load("ckpt.eqx")
 
 Architecture:
-    encoder : (x ⊙ (1-m), m, c) → z         FiLM-MLP, depth `n_hidden_layers`, width `hidden_dim`
-    decoder : (z, c)            → x_hat     FiLM-MLP, mirrored
+    conditioner : c                  → e      shared non-linear embedding of c
+    encoder     : (x, m_orig, m_extra, e) → z  FiLM-MLP, depth `n_hidden_layers`
+    decoder     : (z, e)             → x_hat  FiLM-MLP, mirrored
 
-Training:
-    Each batch we draw an extra random mask `m_extra ~ Bernoulli(mask_ratio)`
-    on top of the catalog mask `m_orig`. The encoder sees zeros at all hidden
-    positions plus a binary `m_total` channel that flags them. The decoder
-    reconstructs all `n_features`, but the loss is averaged only over
-    positions that were *artificially* hidden and *originally* observed —
-    standard MAE / BERT-style denoising objective. This forces the latent
-    code to capture cross-feature structure rather than collapse to identity.
+Two kinds of "masking", kept disentangled (input side vs. output side are
+orthogonal — a position can be fed-but-not-scored, scored-but-corrupted,
+both, or neither):
+
+    Q = m_orig   intrinsic mask  — catalog quality flags. The value was never
+                 measured, so it is *never* a loss target (no ground truth).
+    R = m_extra  random pretext  — positions we artificially hide each step as
+                 regularization, forcing the latent to learn cross-feature
+                 structure. Drawn from the *observed* positions only, so
+                 R ∩ Q = ∅ by construction.
+
+Input side: masked entries get distinct learned tokens (`mask_token` for R,
+`fill_token` for Q), and a single bit-encoded mask channel
+`mask_code = m_orig + 2·m_extra ∈ {0=observed, 1=Q, 2=R}` is appended, so the
+encoder input is `[x_filled, mask_code]` of width `2 * n_features`.
+
+Output side: the decoder reconstructs all `n_features`. The objective here is
+compression (50→latent_dim) with masking as regularization, so the loss runs
+over *every observed* position O = ¬Q — the held-out R positions and the
+still-visible positions weighted independently (R up-weighted by default);
+Q is never scored. See `_loss_fn`.
 
     Loss options (`loss_type`):
       - 'mse' : plain squared error on μ. Decoder out-dim = F.
@@ -32,13 +46,16 @@ Training:
                 'nll' = 0.5(sq/σ² + log σ²) in addition to plain 'mse'.
 
 The conditioning `c` (typically the 5 standardized observing-condition vars,
-brightness first) modulates every hidden activation through FiLM:
+brightness first) is first embedded by a small shared MLP `conditioner(c) = e`,
+then every hidden activation is FiLM-modulated:
 
-    h ← (1 + γ(c)) ⊙ Linear(h) + β(c)
+    h ← (1 + γ(e)) ⊙ Linear(h) + β(e)
 
-i.e. a per-channel affine transform whose scale and shift are linear in `c`.
-At init, γ ≈ 0 / β ≈ 0 (small LeCun init on the FiLM head), so the network
-starts as a plain MLP and learns brightness modulation gradually.
+i.e. a per-channel affine transform whose scale/shift come from a *non-linear*
+function of c (the conditioner), so γ/β can bend with S/N and resolution
+rather than depending on them linearly. At init the per-layer FiLM heads are
+small (γ ≈ 0 / β ≈ 0), so the network starts as a plain MLP and learns the
+conditioning gradually.
 """
 from __future__ import annotations
 
@@ -60,25 +77,55 @@ except ImportError:
 
 
 # ---------------------------------------------------------------- modules
+class _FiLMConditioner(eqx.Module):
+    """Shared non-linear embedding of the conditioning vector `c`.
+
+    A small MLP (`c → embed_dim`, `layers` stages of Linear with GELU between)
+    whose output `e` feeds every FiLM head. Being non-linear in `c`, it lets the
+    per-layer γ/β bend with S/N and resolution rather than depend on them
+    linearly. Computed once per source and shared by encoder + decoder.
+    """
+    layers: list
+
+    def __init__(self, n_cond, embed_dim, layers, *, key):
+        keys = jr.split(key, layers)
+        mods, d = [], n_cond
+        for i in range(layers):
+            mods.append(eqx.nn.Linear(d, embed_dim, key=keys[i]))
+            d = embed_dim
+        self.layers = mods
+
+    def __call__(self, c):
+        h = c
+        for i, lin in enumerate(self.layers):
+            h = lin(h)
+            if i < len(self.layers) - 1:
+                h = jax.nn.gelu(h)
+        return h
+
+
 class FiLMBlock(eqx.Module):
-    """Linear → FiLM(c) → GELU. FiLM head init is small so block ≈ Linear at start."""
+    """Linear → FiLM(e) → GELU, where `e` is the conditioner's embedding of `c`.
+
+    The FiLM head init is small so γ≈0, β≈0 → block ≈ Linear at start.
+    """
     linear: eqx.nn.Linear
     film:   eqx.nn.Linear
     out_dim: int = eqx.field(static=True)
 
-    def __init__(self, in_dim: int, out_dim: int, cond_dim: int, *, key):
+    def __init__(self, in_dim: int, out_dim: int, embed_dim: int, *, key):
         k1, k2 = jr.split(key, 2)
         self.linear = eqx.nn.Linear(in_dim, out_dim, key=k1)
-        film = eqx.nn.Linear(cond_dim, 2 * out_dim, key=k2)
+        film = eqx.nn.Linear(embed_dim, 2 * out_dim, key=k2)
         # Shrink FiLM init so γ≈0, β≈0 → starts as identity modulation.
         film = eqx.tree_at(lambda l: l.weight, film, film.weight * 0.01)
         film = eqx.tree_at(lambda l: l.bias,   film, film.bias   * 0.0)
         self.film = film
         self.out_dim = out_dim
 
-    def __call__(self, h, c):
+    def __call__(self, h, e):
         h = self.linear(h)
-        gb = self.film(c)
+        gb = self.film(e)
         gamma, beta = gb[:self.out_dim], gb[self.out_dim:]
         h = (1.0 + gamma) * h + beta
         return jax.nn.gelu(h)
@@ -87,20 +134,34 @@ class FiLMBlock(eqx.Module):
 class _Encoder(eqx.Module):
     blocks: list
     head: eqx.nn.Linear
+    mask_token: jax.Array     # (F,) learned fill for randomly-masked (R) positions
+    fill_token: jax.Array     # (F,) learned fill for intrinsically-masked (Q) positions
+    n_features: int = eqx.field(static=True)
 
-    def __init__(self, in_dim, hidden, depth, latent, cond_dim, *, key):
+    def __init__(self, n_features, hidden, depth, latent, embed_dim, *, key):
         keys = jr.split(key, depth + 1)
+        in_dim = 2 * n_features            # [x_filled | mask_code]
         blocks, d = [], in_dim
         for i in range(depth):
-            blocks.append(FiLMBlock(d, hidden, cond_dim, key=keys[i]))
+            blocks.append(FiLMBlock(d, hidden, embed_dim, key=keys[i]))
             d = hidden
         self.blocks = blocks
         self.head = eqx.nn.Linear(hidden, latent, key=keys[-1])
+        # Start both tokens at 0 (≈ observed-mean for the ~zero-centred scaling),
+        # then learn distinct fills for "predict me" (R) vs. "absent" (Q).
+        self.mask_token = jnp.zeros(n_features)
+        self.fill_token = jnp.zeros(n_features)
+        self.n_features = n_features
 
-    def __call__(self, x_in, m, c):
-        h = jnp.concatenate([x_in, m], axis=-1)
+    def __call__(self, x, m_orig, m_extra, e):
+        # m_orig and m_extra are disjoint (R drawn from observed only), so the
+        # three regions below never overlap and mask_code ∈ {0, 1, 2} exactly.
+        visible = (1.0 - m_orig) * (1.0 - m_extra)
+        x_filled = x * visible + self.fill_token * m_orig + self.mask_token * m_extra
+        mask_code = m_orig + 2.0 * m_extra          # 0=observed, 1=Q, 2=R
+        h = jnp.concatenate([x_filled, mask_code], axis=-1)
         for blk in self.blocks:
-            h = blk(h, c)
+            h = blk(h, e)
         return self.head(h)
 
 
@@ -108,19 +169,19 @@ class _Decoder(eqx.Module):
     blocks: list
     head: eqx.nn.Linear
 
-    def __init__(self, latent, hidden, depth, out_dim, cond_dim, *, key):
+    def __init__(self, latent, hidden, depth, out_dim, embed_dim, *, key):
         keys = jr.split(key, depth + 1)
         blocks, d = [], latent
         for i in range(depth):
-            blocks.append(FiLMBlock(d, hidden, cond_dim, key=keys[i]))
+            blocks.append(FiLMBlock(d, hidden, embed_dim, key=keys[i]))
             d = hidden
         self.blocks = blocks
         self.head = eqx.nn.Linear(hidden, out_dim, key=keys[-1])
 
-    def __call__(self, z, c):
+    def __call__(self, z, e):
         h = z
         for blk in self.blocks:
-            h = blk(h, c)
+            h = blk(h, e)
         return self.head(h)
 
 
@@ -128,6 +189,7 @@ _LOG_VAR_CLIP = 7.0  # clip log σ² to [-7, 7] for NLL stability
 
 
 class _MAEModule(eqx.Module):
+    conditioner: _FiLMConditioner
     encoder: _Encoder
     decoder: _Decoder
     loss_type: str = eqx.field(static=True)
@@ -145,47 +207,74 @@ class _MAEModule(eqx.Module):
 
 
 # ---------------------------------------------------------------- jitted kernels
-def _forward_single(model, x_i, m_i, c_i):
-    x_in = x_i * (1.0 - m_i)
-    z = model.encoder(x_in, m_i, c_i)
-    out = model.decoder(z, c_i)
-    mu, log_var = model.split_output(out)
-    return mu, log_var, z
+def _encode_single(model, x_i, m_orig_i, m_extra_i, c_i):
+    e = model.conditioner(c_i)
+    return model.encoder(x_i, m_orig_i, m_extra_i, e)
+
+
+def _forward_single(model, x_i, m_orig_i, m_extra_i, c_i):
+    e = model.conditioner(c_i)
+    z = model.encoder(x_i, m_orig_i, m_extra_i, e)
+    return model.decoder(z, e), z
+
+
+def _draw_extra_mask(key, m_orig, mask_ratio):
+    """Sample R ~ Bernoulli(mask_ratio) restricted to observed (¬Q) positions.
+
+    Returns a {0,1} array disjoint from `m_orig` by construction.
+    """
+    observed = 1.0 - m_orig
+    return ((jr.uniform(key, m_orig.shape) < mask_ratio) * (observed > 0)).astype(m_orig.dtype)
+
+
+def _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w):
+    """MSE over observed positions O = ¬Q. Q is never scored.
+
+    Per position the weight is:
+        Q  (m_orig=1)                          → 0          (no ground truth)
+        R  (m_extra=1, observed)               → masked_w   (held-out target)
+        visible observed (¬Q, ¬R)              → unmasked_w (compression target)
+
+    `R` is up-weighted by default (it carries the denoising signal); setting
+    `unmasked_w=0` recovers the canonical held-out-only MAE objective.
+    """
+    observed = 1.0 - m_orig
+    w = observed * (unmasked_w * (1.0 - m_extra) + masked_w * m_extra)
+    sq = (x_hat - x) ** 2
+    return (sq * w).sum() / jnp.clip(w.sum(), 1.0, None)
 
 
 @eqx.filter_jit
-def _loss_fn(model, x, m_orig, c, key, mask_ratio):
-    m_extra = (jr.uniform(key, x.shape) < mask_ratio).astype(x.dtype)
-    m_total = jnp.maximum(m_orig, m_extra)
+def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w):
+    m_extra = _draw_extra_mask(key, m_orig, mask_ratio)
 
-    def fwd(x_i, m_i, c_i):
-        mu, log_var, _ = _forward_single(model, x_i, m_i, c_i)
+    def fwd(x_i, mo_i, me_i, c_i):
+        mu, log_var, _ = _forward_single(model, x_i, mo_i, me_i, c_i)
         return mu, log_var
 
-    mu, log_var = jax.vmap(fwd)(x, m_total, c)
-    loss_mask = m_extra * (1.0 - m_orig)        # artificially-hidden & originally-observed
-    sq = (mu - x) ** 2
-    if model.loss_type == "nll":
-        # 0.5 * ((x-μ)² / σ² + log σ²); constant 0.5*log(2π) dropped.
-        per_elem = 0.5 * (sq * jnp.exp(-log_var) + log_var)
-    else:
-        per_elem = sq
-    return (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+    x_hat = jax.vmap(fwd)(x, m_orig, m_extra, c)
+    return _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w)
 
 
 @eqx.filter_jit
-def _step_fn(model, opt_state, x, m, c, key, mask_ratio, optimizer):
-    loss, grads = eqx.filter_value_and_grad(_loss_fn)(model, x, m, c, key, mask_ratio)
+def _step_fn(model, opt_state, x, m, c, key, mask_ratio, masked_w, unmasked_w, optimizer):
+    loss, grads = eqx.filter_value_and_grad(_loss_fn)(
+        model, x, m, c, key, mask_ratio, masked_w, unmasked_w
+    )
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
     return model, opt_state, loss
 
 
+def _zeros_like_mask(m):
+    return jnp.zeros_like(m)
+
+
 @eqx.filter_jit
 def _encode_fn(model, x, m, c):
+    """Latent code using the catalog mask only (no extra masking)."""
     def per_row(x_i, m_i, c_i):
-        x_in = x_i * (1.0 - m_i)
-        return model.encoder(x_in, m_i, c_i)
+        return _encode_single(model, x_i, m_i, _zeros_like_mask(m_i), c_i)
     return jax.vmap(per_row)(x, m, c)
 
 
@@ -201,51 +290,50 @@ def _per_elem_score(sq, log_var, score_type):
 @eqx.filter_jit
 def _reconstruct_fn(model, x, m, c):
     def per_row(x_i, m_i, c_i):
-        mu, _, _ = _forward_single(model, x_i, m_i, c_i)
-        return mu
+        x_hat, _ = _forward_single(model, x_i, m_i, _zeros_like_mask(m_i), c_i)
+        return x_hat
     return jax.vmap(per_row)(x, m, c)
 
 
 @eqx.filter_jit
-def _predict_fn(model, x, m, c):
-    """Per-row (mu, log_var). For loss_type='mse', log_var is zeros."""
-    def per_row(x_i, m_i, c_i):
-        mu, lv, _ = _forward_single(model, x_i, m_i, c_i)
-        return mu, lv
-    return jax.vmap(per_row)(x, m, c)
+def _self_recon_err_fn(model, x, m, c):
+    """Per-source MSE over *all* originally-observed positions (no extra masking).
 
-
-@eqx.filter_jit
-def _self_recon_err_fn(model, x, m, c, score_type):
-    """Per-source error on originally-observed positions (no extra masking)."""
+    This is the headline anomaly score: it measures how well the 50→latent_dim
+    code reconstructs every feature that was actually measured.
+    """
     def per_row(x_i, m_i, c_i):
-        mu, log_var, _ = _forward_single(model, x_i, m_i, c_i)
-        sq = (mu - x_i) ** 2
-        per_elem = _per_elem_score(sq, log_var, score_type)
+        x_hat, _ = _forward_single(model, x_i, m_i, _zeros_like_mask(m_i), c_i)
+        sq = (x_hat - x_i) ** 2
         obs = 1.0 - m_i
         return (per_elem * obs).sum() / jnp.clip(obs.sum(), 1.0, None)
     return jax.vmap(per_row)(x, m, c)
 
 
 @eqx.filter_jit
-def _mc_recon_err_fn(model, x, m, c, key, mask_ratio, score_type):
-    """Per-source error on positions we artificially hide (one MC draw)."""
-    m_extra = (jr.uniform(key, x.shape) < mask_ratio).astype(x.dtype)
-    m_total = jnp.maximum(m, m_extra)
+def _mc_recon_err_fn(model, x, m_orig, c, key, mask_ratio):
+    """Per-source MSE on artificially hidden (R) positions, one MC draw.
 
-    def per_row(x_i, m_total_i, m_extra_i, m_orig_i, c_i):
-        mu, log_var, _ = _forward_single(model, x_i, m_total_i, c_i)
-        loss_mask = m_extra_i * (1.0 - m_orig_i)
-        sq = (mu - x_i) ** 2
-        per_elem = _per_elem_score(sq, log_var, score_type)
-        return (per_elem * loss_mask).sum() / jnp.clip(loss_mask.sum(), 1.0, None)
+    R is drawn from observed positions only, so every scored position has a
+    real target.
+    """
+    m_extra = _draw_extra_mask(key, m_orig, mask_ratio)
 
-    return jax.vmap(per_row)(x, m_total, m_extra, m, c)
+    def per_row(x_i, m_orig_i, m_extra_i, c_i):
+        x_hat, _ = _forward_single(model, x_i, m_orig_i, m_extra_i, c_i)
+        sq = (x_hat - x_i) ** 2
+        return (sq * m_extra_i).sum() / jnp.clip(m_extra_i.sum(), 1.0, None)
+
+    return jax.vmap(per_row)(x, m_orig, m_extra, c)
 
 
 @eqx.filter_jit
 def _per_feature_loo_fn(model, x, m, c):
     """For each (source, feature j), reconstruct x_j after masking only j.
+
+    Feature j is held out as an R position (learned mask token + R code); the
+    catalog mask Q is left in place. If j is already a Q position it stays Q (no
+    double-masking), and its reconstruction is the ordinary forward pass.
 
     Returns (N, F) reconstructed values at the masked diagonal.
     """
@@ -253,12 +341,14 @@ def _per_feature_loo_fn(model, x, m, c):
     eye = jnp.eye(F, dtype=x.dtype)
 
     def per_row(x_i, m_orig_i, c_i):
+        observed = 1.0 - m_orig_i
+
         def mask_j(j_onehot):
-            m_total = jnp.maximum(m_orig_i, j_onehot)
-            mu, _, _ = _forward_single(model, x_i, m_total, c_i)
-            return mu
-        x_hats = jax.vmap(mask_j)(eye)        # (F, F)
-        return jnp.diagonal(x_hats)           # (F,)
+            m_extra = j_onehot * observed          # only newly hide it if observed
+            x_hat, _ = _forward_single(model, x_i, m_orig_i, m_extra, c_i)
+            return x_hat
+        x_hats = jax.vmap(mask_j)(eye)             # (F, F)
+        return jnp.diagonal(x_hats)                # (F,)
 
     return jax.vmap(per_row)(x, m, c)
 
@@ -276,8 +366,12 @@ class MaskedAutoencoder:
         latent_dim: int = 16,
         hidden_dim: int = 256,
         n_hidden_layers: int = 3,
+        cond_embed_dim: int = 16,
+        cond_embed_layers: int = 2,
         # training
         mask_ratio: float = 0.5,
+        masked_loss_weight: float = 1.0,
+        unmasked_loss_weight: float = 0.3,
         batch_size: int = 8192,
         learning_rate: float = 1e-3,
         n_epochs: int = 10,
@@ -292,7 +386,11 @@ class MaskedAutoencoder:
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.n_hidden_layers = n_hidden_layers
+        self.cond_embed_dim = cond_embed_dim
+        self.cond_embed_layers = cond_embed_layers
         self.mask_ratio = mask_ratio
+        self.masked_loss_weight = masked_loss_weight
+        self.unmasked_loss_weight = unmasked_loss_weight
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.n_epochs = n_epochs
@@ -305,13 +403,19 @@ class MaskedAutoencoder:
 
     def _build(self):
         key = jr.PRNGKey(self.seed)
-        ke, kd = jr.split(key)
+        kc, ke, kd = jr.split(key, 3)
+        conditioner = _FiLMConditioner(
+            n_cond=self.n_cond,
+            embed_dim=self.cond_embed_dim,
+            layers=self.cond_embed_layers,
+            key=kc,
+        )
         encoder = _Encoder(
-            in_dim=2 * self.n_features,        # [x_in | mask]
+            n_features=self.n_features,        # input is [x_filled | mask_code], width 2F
             hidden=self.hidden_dim,
             depth=self.n_hidden_layers,
             latent=self.latent_dim,
-            cond_dim=self.n_cond,
+            embed_dim=self.cond_embed_dim,
             key=ke,
         )
         dec_out = 2 * self.n_features if self.loss_type == "nll" else self.n_features
@@ -319,16 +423,11 @@ class MaskedAutoencoder:
             latent=self.latent_dim,
             hidden=self.hidden_dim,
             depth=self.n_hidden_layers,
-            out_dim=dec_out,
-            cond_dim=self.n_cond,
+            out_dim=self.n_features,
+            embed_dim=self.cond_embed_dim,
             key=kd,
         )
-        self.model = _MAEModule(
-            encoder=encoder,
-            decoder=decoder,
-            loss_type=self.loss_type,
-            n_features=self.n_features,
-        )
+        self.model = _MAEModule(conditioner=conditioner, encoder=encoder, decoder=decoder)
 
     # ----------------------------------------------------------------- batching
     def _iter_batches(self, x, m, c, *, shuffle, rng, batch_size=None):
@@ -355,6 +454,9 @@ class MaskedAutoencoder:
         checkpoint_dir: Optional[str | Path] = None,
     ):
         """Fit the MAE on `(x, mask, c)`. Optionally tracks validation loss.
+
+        `mask` is the intrinsic / quality-flag mask Q (1 = imputed). The random
+        pretext mask R is drawn internally each step from observed positions.
 
         Populates `self.history`:
             step_loss          per-step training loss
@@ -414,7 +516,9 @@ class MaskedAutoencoder:
             for step_i, (xb, mb, cb) in enumerate(step_iter):
                 key, sub = jr.split(key)
                 self.model, opt_state, loss = _step_fn(
-                    self.model, opt_state, xb, mb, cb, sub, self.mask_ratio, optimizer
+                    self.model, opt_state, xb, mb, cb, sub,
+                    self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
+                    optimizer,
                 )
                 lf = float(loss)
                 train_losses.append(lf)
@@ -434,8 +538,10 @@ class MaskedAutoencoder:
                 for xb, mb, cb in self._iter_batches(val_x, val_mask, val_c,
                                                      shuffle=False, rng=rng):
                     vsub, kk = jr.split(vsub)
-                    val_losses.append(float(_loss_fn(self.model, xb, mb, cb,
-                                                     kk, self.mask_ratio)))
+                    val_losses.append(float(_loss_fn(
+                        self.model, xb, mb, cb, kk,
+                        self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
+                    )))
                 val_l = float(np.mean(val_losses))
                 history["epoch_val_loss"].append(val_l)
                 if val_l < history["best_val_loss"]:
@@ -598,21 +704,15 @@ class MaskedAutoencoder:
     ) -> np.ndarray:
         """Per-source reconstruction-error score. Higher = more anomalous.
 
-        `score_type`:
-          - 'mse'         : raw squared error (μ − x)². Always available.
-          - 'mahalanobis' : (μ − x)² / σ². Down-weights features the model
-                            knows are noisy. Requires `loss_type='nll'`.
-          - 'nll'         : 0.5 * ((μ − x)² / σ² + log σ²). The training
-                            objective itself. Requires `loss_type='nll'`.
-
-        Two MC modes:
-          - `mc_seeds=0` (default): scored on originally observed positions,
-            no extra masking. Cheapest; risk is that the bottleneck partly
-            identity-bypasses high-information features.
+        Two modes:
+          - `mc_seeds=0` (default): self-reconstruction MSE over *all* observed
+            features, no extra masking. This is the headline score — it asks how
+            well the 50→latent_dim code reproduces everything that was measured.
           - `mc_seeds>0`: averages over `mc_seeds` random masking draws at
-            `mask_ratio` (defaults to the training value). Scored only on
-            artificially hidden, originally observed positions. Closer to
-            the training objective; more robust to identity bypass.
+            `mask_ratio` (defaults to the training value). MSE measured only on
+            artificially hidden (R) positions, which are drawn from the observed
+            set so every one has a real target. A held-out diagnostic; more
+            robust to identity bypass on highly informative features.
 
         Returns `(N,)` numpy array.
         """
@@ -670,10 +770,14 @@ class MaskedAutoencoder:
     ) -> tuple[np.ndarray, np.ndarray]:
         """Leave-one-out per-feature reconstruction.
 
-        For each (source, feature j), masks only feature j and reconstructs
-        it from the rest of the row. Returns:
+        For each (source, feature j), masks only feature j (as an R position)
+        and reconstructs it from the rest of the row. Returns:
             x_hat_loo : (N, F)  reconstructed value at the masked position
             sq_err    : (N, F)  (x - x_hat_loo)**2
+
+        Note `sq_err[:, j]` is only meaningful where feature j was observed
+        (`mask[:, j] == 0`); on intrinsically-masked positions there is no
+        ground truth.
 
         Cost is F forward passes per source, so use on a subset (this is the
         per-source diagnostic equivalent of the flow's `per_feature_anomaly_score`).

@@ -43,21 +43,45 @@ kwargs — built for use straight from a notebook.
 ## Design
 
 - **Features `x`**: shape (N, 51), pre-scaled to ~(-10, 10).
-- **Mask**: per-feature binary (1 = imputed). Of the 51 features, 48 have
-  stored masks; the remaining 3 had no bad values and get all-zero masks
-  reconstructed by `MAEDataset` so `mask` has the same column count as `x`.
+- **Two kinds of mask, kept disentangled.** "Masking" changes two
+  *independent* things — what the encoder is fed (input side) and what the
+  loss scores (output side) — so we never fuse them into one bit:
+  - **`Q` — intrinsic mask** (`mask` from the catalog, 1 = imputed): the
+    value was never measured. Of the 51 features, 48 have stored masks; the
+    other 3 get all-zero masks from `MAEDataset` so `mask` matches `x`'s
+    column count. `Q` is **never** a loss target (no ground truth exists).
+  - **`R` — random pretext mask**: positions artificially hidden each step
+    so the latent must learn cross-feature structure. Drawn from the
+    *observed* positions only, so `R ∩ Q = ∅` and every held-out position
+    has a real target.
 - **Conditioning `c`**: shape (N, 5) of standardized observing-condition
-  vars (brightness, FWHM, sky median, sky σ, S/N). Standardization stats
-  are saved on the dataset (`ds.cond_mu`, `ds.cond_sd`).
-- **Encoder**: input `[x ⊙ (1-m), m]` of width `2 * n_features`, then
+  vars (brightness, FWHM, sky median, sky σ, S/N). Always observed, so it
+  sits outside the masking machinery entirely — never masked, never filled.
+  Standardization stats are saved on the dataset (`ds.cond_mu`, `ds.cond_sd`).
+- **Encoder**: input `[x_filled, mask_code]` of width `2 * n_features`, then
   `n_hidden_layers` of FiLM-modulated `Linear → GELU` to a tight bottleneck
-  of size `latent_dim`.
+  of size `latent_dim`. `x_filled` replaces masked entries with **distinct
+  learned tokens** — a `mask_token` for `R` ("predict me") and a `fill_token`
+  for `Q` ("absent"); both init at 0 ≈ observed-mean for the centred scaling,
+  then learn. The single **bit-encoded** mask channel
+  `mask_code = m_orig + 2·m_extra ∈ {0=observed, 1=Q, 2=R}` carries the state
+  in one column instead of two (the types are mutually exclusive, so one
+  channel suffices and the redundant all-zero dimension is dropped).
 - **Decoder**: mirror — `latent_dim → hidden → ... → n_features`, also
-  FiLM-modulated by `c`.
+  FiLM-modulated by `c`. Reconstructs all `n_features`.
 - **FiLM**: each hidden activation is rescaled as
-  `h ← (1 + γ(c)) ⊙ Linear(h) + β(c)` with `γ, β` linear in `c`. The FiLM
-  head is initialized small so γ ≈ 0, β ≈ 0 — at step 0 the network is a
-  plain MLP and conditioning is learned gradually.
+  `h ← (1 + γ(e)) ⊙ Linear(h) + β(e)`, applied at **every** encoder and
+  decoder block. `e = conditioner(c)` is a small shared MLP that embeds `c`
+  **non-linearly**, so γ/β can bend with S/N and resolution rather than
+  depend on them linearly (a single linear FiLM head can't represent
+  threshold-like noise/depth effects). The per-layer FiLM heads are
+  initialized small so γ ≈ 0, β ≈ 0 — at step 0 the network is a plain MLP
+  and conditioning is learned gradually. FiLM **modulates** the feature
+  stream (γ can drive a unit toward 0, gating a channel when the conditioning
+  says it is unreliable); cross-parameter degeneracies are still represented
+  by the unconditioned `Linear` layers that mix channels between FiLM ops.
+  The conditioning never travels the main connections as data, which is what
+  concatenating `c` would do.
 
 ### Why FiLM rather than concatenating `c` to the input
 
@@ -65,25 +89,47 @@ Brightness influences nearly every measurement (S/N, PSF coupling,
 deblending), so it needs to *modulate* the rest of the network's response,
 not just add a constant offset. Concatenating `c` to the input layer
 gives a fixed bias on each downstream activation; FiLM gives a per-channel
-affine transform whose scale and shift depend on `c`, at every layer.
+affine transform whose scale and shift depend non-linearly on `c`, at every
+layer.
 Practically: a galaxy that looks dim and a galaxy that looks bright should
 end up at the same latent location if they're the same morphology — FiLM
 lets the encoder "divide out" brightness instead of carrying it through.
 
 ### Training objective
 
-Each batch we draw an extra random mask `m_extra ~ Bernoulli(mask_ratio)`
-on top of the catalog mask `m_orig`. The encoder sees zeros at all hidden
-positions plus a binary `m_total = m_orig | m_extra` channel that flags
-them. The decoder reconstructs all 51 features. Loss is MSE averaged over
-positions that are *artificially hidden* and *originally observed*:
+The real objective is **compression — encode 50 features in a `latent_dim`
+code and reconstruct them all** — with masking acting as regularization. So
+every observed feature's reconstruction matters, masked or not.
 
-    loss = mean_{m_extra=1, m_orig=0} (x_hat - x)^2
+Each batch we draw a random pretext mask
+`m_extra ~ Bernoulli(mask_ratio)` **over the observed positions only**
+(`m_orig = 0`), on top of the catalog mask `m_orig`. The encoder is fed the
+learned tokens at the masked slots plus the bit-encoded `mask_code` channel.
+The decoder reconstructs all 51 features.
 
-i.e. the standard MAE / BERT-style denoising objective. Originally-imputed
-positions are never used as ground truth (they aren't real). Artificially
-masking forces the latent to capture cross-feature structure rather than
-collapse to identity.
+The loss is an MSE over **every observed position** `O = ¬Q`, with the held-out
+and still-visible regions weighted independently:
+
+    loss = ( masked_w · Σ_{R} (x̂-x)²  +  unmasked_w · Σ_{visible∩O} (x̂-x)² ) / Σ weights
+
+| region                          | `mask_code` | weight                 |
+|---------------------------------|-------------|------------------------|
+| `Q` intrinsically masked        | 1           | **0** (no ground truth)|
+| `R` held-out (denoising signal) | 2           | `masked_loss_weight`   |
+| visible & observed              | 0           | `unmasked_loss_weight` |
+
+Both masked and unmasked features are scored. The held-out `R` positions carry
+the MAE / denoising signal that forces the latent to learn cross-feature
+structure, so they are **up-weighted by default** (`masked=1.0`,
+`unmasked=0.3`); the visible positions keep the bottleneck honest as a
+compressor of the full feature vector. The intrinsic mask `Q` is never scored —
+it has no ground truth. Set `unmasked_loss_weight=0` for the strict held-out-only
+MAE, or raise it toward `1.0` to weight plain reconstruction more.
+
+The default **anomaly score** (`anomaly_score(...)`, `mc_seeds=0`) is the same
+full-reconstruction error over *all* observed features — consistent with the
+compression objective. The held-out MC variant (`mc_seeds>0`) is a secondary
+diagnostic that scores only the artificially-hidden positions.
 
 ### Two ways to use the trained model
 
@@ -109,7 +155,9 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
 | `n_cond` | — | dim of `c` (just the continuous conditioners; mask is a separate input). Match `ds.n_cond`. |
 | `latent_dim` | 16 | bottleneck width. The single most important capacity knob — too small and distinct galaxy types collapse together; too large and the AE identity-bypasses, blunting the anomaly signal. |
 | `hidden_dim` | 256 | width of every FiLM-MLP layer in encoder and decoder. |
-| `n_hidden_layers` | 3 | depth of the encoder (decoder mirrors it). Each block is `Linear → FiLM(c) → GELU`. |
+| `n_hidden_layers` | 3 | depth of the encoder (decoder mirrors it). Each block is `Linear → FiLM(e) → GELU`. |
+| `cond_embed_dim` | 16 | width of the shared conditioner that embeds `c` non-linearly into `e`, then feeds every FiLM head. Drives FiLM cost (≈ `2·n_hidden_layers · cond_embed_dim · hidden_dim`). |
+| `cond_embed_layers` | 2 | depth of that conditioner MLP. `≥2` makes the embedding non-linear in `c`; `1` collapses it to a linear FiLM generator. |
 
 - **`latent_dim`** — 8 is enough to separate the headline galaxy classes
   (early/late/irregular) but smears finer structure; 32 captures finer
@@ -125,7 +173,9 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
 
 | param | default | what it controls |
 |-------|---------|------------------|
-| `mask_ratio` | 0.5 | fraction of features artificially hidden each step. The MAE objective is computed only on these positions. |
+| `mask_ratio` | 0.5 | fraction of *observed* features artificially hidden (`R`) each step. |
+| `masked_loss_weight` | 1.0 | loss weight on the held-out `R` positions (the denoising target). |
+| `unmasked_loss_weight` | 0.3 | loss weight on the still-visible observed positions. `R` is up-weighted relative to this; set to `0` for strict held-out-only MAE, or `1.0` to weight plain reconstruction equally. |
 | `batch_size` | 8192 | examples per gradient step. |
 | `learning_rate` | 1e-3 | Adam step size. |
 | `n_epochs` | 10 | full passes over the training set. |
@@ -137,7 +187,16 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
   (Gini and M20 are correlated but Sersic n is not predictable from C/A/S
   alone). 0.4–0.6 is the useful range. Too high → loss flatlines high
   (model has no context). Too low → encoder learns to identity-pass
-  visible features and the latent is uninformative.
+  visible features and the latent is uninformative. The ratio is over the
+  *observed* positions, so mask budget is never spent on `Q` slots you drop
+  from the loss anyway.
+- **`masked_loss_weight` / `unmasked_loss_weight`** — the held-out–vs–visible
+  balance. Default `1.0 / 0.3` up-weights the held-out `R` positions (the
+  denoising signal) while still scoring every visible feature, since the goal
+  is to reconstruct the whole vector through the bottleneck. `unmasked=0` is
+  the canonical held-out-only MAE; `unmasked=1.0` weights plain reconstruction
+  equally with the held-out signal. If `anomaly_score` separation weakens
+  (identity bypass), lower `unmasked_loss_weight` toward the held-out emphasis.
 - **`batch_size`** — larger = smoother gradients, fewer steps per epoch.
   Push up while it fits; 16k–32k is comfortable on 8 GB for this model.
 - **`learning_rate`** — twitchy loss → drop to 5e-4. Slow convergence at
@@ -159,7 +218,8 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
   binding constraint; the encoder/decoder MLPs are.
 - `c`-leakage: cluster labels in `z` correlate strongly with brightness
   → FiLM isn't separating out the conditioning. Train longer; if it
-  persists, increase `hidden_dim` (FiLM head capacity scales with it).
+  persists, increase `cond_embed_dim` / `cond_embed_layers` (the FiLM
+  conditioner's capacity to model non-linear `c` effects).
 - Per-feature LOO error has one feature systematically off → that
   feature is the hardest to predict from the rest, which usually means
   it carries genuinely independent signal. Check whether it correlates
@@ -291,7 +351,7 @@ clustering). Choose by what you need:
 | anomaly score            | `-log p(x \| c)` — calibrated, per-source | reconstruction MSE — uncalibrated   |
 | latent space             | `(N, 51)` Gaussianized, invertible        | `(N, latent_dim)` compressed        |
 | handles missing values   | mask flags appended to `c`                | mask is a first-class encoder input |
-| brightness conditioning  | concatenated into `c`                     | FiLM-modulated at every layer       |
+| brightness conditioning  | concatenated into `c`                     | non-linear FiLM at every layer      |
 | forward cost (per source)| 1 flow pass                               | 1 AE pass                           |
 | per-feature score        | conditional MC z-score (`diag.py`)        | leave-one-out reconstruction        |
 

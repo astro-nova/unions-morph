@@ -35,8 +35,10 @@ encoder input is `[x_filled, mask_code]` of width `2 * n_features`.
 Output side: the decoder reconstructs all `n_features`. The objective here is
 compression (50→latent_dim) with masking as regularization, so the loss runs
 over *every observed* position O = ¬Q — the held-out R positions and the
-still-visible positions weighted independently (R up-weighted by default);
-Q is never scored. See `_loss_fn`.
+still-visible positions weighted independently (R up-weighted by default).
+Q is not scored by default, but `quality_loss_weight > 0` folds the catalog-
+imputed values at Q positions into the objective (the same flag also weights
+Q in the headline anomaly score). See `_loss_fn` / `_weighted_recon_loss`.
 
 The conditioning `c` (typically the 5 standardized observing-condition vars,
 brightness first) is first embedded by a small shared MLP `conditioner(c) = e`,
@@ -260,24 +262,30 @@ def _draw_extra_mask(key, m_orig, mask_ratio):
     return ((jr.uniform(key, m_orig.shape) < mask_ratio) * (observed > 0)).astype(m_orig.dtype)
 
 
-def _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w):
-    """MSE over observed positions O = ¬Q. Q is never scored.
+def _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w, quality_w):
+    """Weighted MSE over reconstruction targets.
 
     Per position the weight is:
-        Q  (m_orig=1)                          → 0          (no ground truth)
+        Q  (m_orig=1)                          → quality_w  (imputed fill target)
         R  (m_extra=1, observed)               → masked_w   (held-out target)
         visible observed (¬Q, ¬R)              → unmasked_w (compression target)
 
     `R` is up-weighted by default (it carries the denoising signal); setting
     `unmasked_w=0` recovers the canonical held-out-only MAE objective.
+
+    `quality_w` defaults to 0, so Q positions are normally *not* scored — the
+    value was never measured, so the only "target" is whatever the catalog
+    imputed into `x` (and the encoder saw `fill_token` there, not the value).
+    Set it > 0 to fold those imputed values into the objective and measure the
+    effect. Q and R are disjoint, so the three regions never overlap.
     """
     observed = 1.0 - m_orig
-    w = observed * (unmasked_w * (1.0 - m_extra) + masked_w * m_extra)
+    w = observed * (unmasked_w * (1.0 - m_extra) + masked_w * m_extra) + quality_w * m_orig
     sq = (x_hat - x) ** 2
     return (sq * w).sum() / jnp.clip(w.sum(), 1.0, None)
 
 
-def _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w):
+def _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w):
     """Shared kernel: artificial masking + forward + weighted recon loss.
 
     Returns (recon_loss, z) so the adversary can also consume `z`.
@@ -289,19 +297,19 @@ def _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w):
         return x_hat, z
 
     x_hat, z = jax.vmap(fwd)(x, m_orig, m_extra, c)
-    recon = _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w)
+    recon = _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w, quality_w)
     return recon, z
 
 
 @eqx.filter_jit
-def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, step):
+def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step):
     """Total loss = recon_loss + adv_loss (adversary pushed via gradient reversal).
 
     `step` is a JAX scalar (current global step) used to ramp the adversarial
     weight linearly from 0 to `model.adv_lambda` over `model.adv_warmup_steps`.
     Returns (total_loss, (recon_loss, adv_loss)) for use with `has_aux=True`.
     """
-    recon, z = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w)
+    recon, z = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w)
 
     if model.adv_head is not None:
         target_idx = jnp.array(model.adv_target_dims, dtype=jnp.int32)
@@ -320,16 +328,16 @@ def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, step):
 
 
 @eqx.filter_jit
-def _val_loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w):
+def _val_loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w):
     """Validation: recon loss only (the metric we actually care about)."""
-    recon, _ = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w)
+    recon, _ = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w)
     return recon
 
 
 @eqx.filter_jit
-def _step_fn(model, opt_state, x, m, c, key, mask_ratio, masked_w, unmasked_w, step, optimizer):
+def _step_fn(model, opt_state, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step, optimizer):
     (loss, aux), grads = eqx.filter_value_and_grad(_loss_fn, has_aux=True)(
-        model, x, m, c, key, mask_ratio, masked_w, unmasked_w, step
+        model, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step
     )
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -357,17 +365,20 @@ def _reconstruct_fn(model, x, m, c):
 
 
 @eqx.filter_jit
-def _self_recon_err_fn(model, x, m, c):
-    """Per-source MSE over *all* originally-observed positions (no extra masking).
+def _self_recon_err_fn(model, x, m, c, quality_w):
+    """Per-source MSE over reconstruction targets (no extra masking).
 
     This is the headline anomaly score: it measures how well the 50→latent_dim
-    code reconstructs every feature that was actually measured.
+    code reconstructs every feature that was actually measured. Observed
+    positions get weight 1; intrinsically-masked (Q) positions get weight
+    `quality_w` (default 0, i.e. excluded — their only target is the catalog
+    imputation). Set `quality_w>0` to also score the imputed Q positions.
     """
     def per_row(x_i, m_i, c_i):
         x_hat, _ = _forward_single(model, x_i, m_i, _zeros_like_mask(m_i), c_i)
         sq = (x_hat - x_i) ** 2
-        obs = 1.0 - m_i
-        return (sq * obs).sum() / jnp.clip(obs.sum(), 1.0, None)
+        w = (1.0 - m_i) + quality_w * m_i
+        return (sq * w).sum() / jnp.clip(w.sum(), 1.0, None)
     return jax.vmap(per_row)(x, m, c)
 
 
@@ -433,6 +444,7 @@ class MaskedAutoencoder:
         mask_ratio: float = 0.5,
         masked_loss_weight: float = 1.0,
         unmasked_loss_weight: float = 0.3,
+        quality_loss_weight: float = 0.0,
         batch_size: int = 8192,
         learning_rate: float = 1e-3,
         n_epochs: int = 10,
@@ -464,6 +476,7 @@ class MaskedAutoencoder:
         self.mask_ratio = mask_ratio
         self.masked_loss_weight = masked_loss_weight
         self.unmasked_loss_weight = unmasked_loss_weight
+        self.quality_loss_weight = float(quality_loss_weight)
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.n_epochs = n_epochs
@@ -634,7 +647,7 @@ class MaskedAutoencoder:
                 self.model, opt_state, loss, aux = _step_fn(
                     self.model, opt_state, xb, mb, cb, sub,
                     self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
-                    step_arr, optimizer,
+                    self.quality_loss_weight, step_arr, optimizer,
                 )
                 global_step += 1
                 lf = float(loss)
@@ -668,6 +681,7 @@ class MaskedAutoencoder:
                     val_losses.append(float(_val_loss_fn(
                         self.model, xb, mb, cb, kk,
                         self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
+                        self.quality_loss_weight,
                     )))
                 val_l = float(np.mean(val_losses))
                 history["epoch_val_loss"].append(val_l)
@@ -740,13 +754,13 @@ class MaskedAutoencoder:
         sq = (y_pred - x) ** 2
 
         mr = self.mask_ratio if mask_ratio is None else mask_ratio
-        mw, uw = self.masked_loss_weight, self.unmasked_loss_weight
+        mw, uw, qw = self.masked_loss_weight, self.unmasked_loss_weight, self.quality_loss_weight
         rng = np.random.default_rng(seed)
         observed = 1.0 - mask
         losses = np.empty(n_draws, dtype=np.float64)
         for k in range(n_draws):
             m_extra = (rng.random(x.shape) < mr).astype(np.float32) * observed
-            w = observed * (uw * (1.0 - m_extra) + mw * m_extra)
+            w = observed * (uw * (1.0 - m_extra) + mw * m_extra) + qw * mask
             denom = max(w.sum(), 1.0)
             losses[k] = (sq * w).sum() / denom
         return float(losses.mean())
@@ -813,6 +827,7 @@ class MaskedAutoencoder:
         *,
         mc_seeds: int = 0,
         mask_ratio: Optional[float] = None,
+        quality_weight: Optional[float] = None,
         batch_size: Optional[int] = None,
         progress: bool = False,
         seed: int = 0,
@@ -820,17 +835,22 @@ class MaskedAutoencoder:
         """Per-source reconstruction-error score. Higher = more anomalous.
 
         Two modes:
-          - `mc_seeds=0` (default): self-reconstruction MSE over *all* observed
+          - `mc_seeds=0` (default): self-reconstruction MSE over the observed
             features, no extra masking. This is the headline score — it asks how
             well the 50→latent_dim code reproduces everything that was measured.
+            Intrinsically-masked (Q) positions are weighted by `quality_weight`
+            (defaults to `self.quality_loss_weight`, i.e. excluded unless set);
+            pass an explicit value to override per call.
           - `mc_seeds>0`: averages over `mc_seeds` random masking draws at
             `mask_ratio` (defaults to the training value). MSE measured only on
             artificially hidden (R) positions, which are drawn from the observed
             set so every one has a real target. A held-out diagnostic; more
-            robust to identity bypass on highly informative features.
+            robust to identity bypass on highly informative features. (Q never
+            enters this mode — R is drawn from observed positions only.)
 
         Returns `(N,)` numpy array.
         """
+        qw = self.quality_loss_weight if quality_weight is None else float(quality_weight)
         bs = batch_size or self.batch_size
         n_steps = (x.shape[0] + bs - 1) // bs
         rng = np.random.default_rng(0)
@@ -843,7 +863,7 @@ class MaskedAutoencoder:
         if mc_seeds <= 0:
             pos = 0
             for xb, mb, cb in it:
-                eb = _self_recon_err_fn(self.model, xb, mb, cb)
+                eb = _self_recon_err_fn(self.model, xb, mb, cb, qw)
                 n = eb.shape[0]
                 out[pos:pos + n] = np.asarray(eb)
                 pos += n

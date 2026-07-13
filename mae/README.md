@@ -128,6 +128,51 @@ To verify the gradient is gone after training, regress `c` from `z`
 (linear or MLP probe) on a held-out set — high R² means leakage remains;
 near-zero R² for the targeted dims means the adversary did its job.
 
+### Latent structure regularizers (optional)
+
+A pure reconstruction loss pins down only the latent *subspace*, not its
+basis: any invertible linear map of `z` can be absorbed by the decoder's
+first layer at zero cost, so which direction each dim points is an accident
+of initialization. Two independent knobs (both off by default) break that
+symmetry so individual dims become meaningful. They compose with each other
+and with the adversary; the adversarial head always sees the **full** code,
+so `c`-leakage is scrubbed from every dim regardless of truncation.
+
+**Nested dropout (`nested_dropout_p > 0`) — importance-ordered dims.**
+Each training row draws `k ~ Geometric(p)` (clipped to `latent_dim`) and the
+decoder sees only `z[:k]`, rest zeroed. Reconstruction-critical information
+is forced into the early dims, so `z[:k]` is the best available k-dim code
+for *every* k — PCA's ordered-components property, with a fully nonlinear
+map (in the linear case this provably recovers PCA). Side effects you get
+for free: pick the effective latent size *after* training from
+`truncation_curve(...)` (its knee is the effective dimensionality), and
+late dims going quiet is dimensionality selection, not collapse. Expect the
+leading dims to carry cluster identity — multimodal marginals there are a
+feature, not a bug. Guide: `E[k] ≈ 1/p`, so with `latent_dim=16`, `p=0.1`
+truncates most rows (mean k ≈ 10, ~20% of rows keep the full code); `p → 0`
+approaches plain training.
+
+**Jacobian orthogonality (`jac_ortho_lambda > 0`) — non-overlapping
+effects.** Penalizes the mean squared cosine between columns of the decoder
+Jacobian `∂x̂/∂z` (column i = the feature-space direction latent i moves),
+on `jac_ortho_batch` rows per step. Different dims are pushed to move
+*disjoint* feature combinations at every point of the manifold —
+curvilinear-orthogonal coordinates. This is deliberately the Gram/cosine
+form and **not** a Hessian-diagonal penalty: it does not force the decoder
+to be additive, so nonlinear interactions between latents (polar-coordinate
+style) remain representable. Cosines make it scale-invariant (can't be
+gamed by shrinking effects), and dims that nested dropout has killed
+contribute ≈ 0, so the two regularizers don't fight. The penalty is
+evaluated at the codes the decoder actually consumed (truncated ones when
+nested dropout is on), which with ordering reads like Gram–Schmidt: each
+newly activated dim adds an effect orthogonal to those before it.
+
+After training, interpret axes with latent traversals: sweep one dim of `z`
+across its population range, `decode(z, c)`, and watch which features
+respond. If the population is clustered, traverse from cluster centroids
+rather than the global median — per-cluster axis meanings are the honest
+level of description for factors that only exist in some types.
+
 ### Training objective
 
 The real objective is **compression — encode 50 features in a `latent_dim`
@@ -171,6 +216,7 @@ diagnostic that scores only the artificially-hidden positions.
 | anomaly detection   | `anomaly_score(x, m, c)`     | per-source reconstruction error |
 | pattern discovery   | `encode(x, m, c)`            | `(N, latent_dim)` latent code   |
 | inspect a source    | `per_feature_anomaly(...)`   | leave-one-out recon per feature |
+| effective dim       | `truncation_curve(x, m, c)`  | recon error vs. keeping `z[:k]` |
 
 The latent code is a compressed, brightness-scrubbed embedding suitable
 for HDBSCAN / GMM directly (same recommendation as for the flow's `z`:
@@ -237,6 +283,30 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
 - **`n_epochs`** — with ~100M sources, watch `epoch_val_loss` and stop
   when it flattens. 10 is a reasonable starting budget.
 
+### Latent structure regularizers
+
+Off by default. See "Latent structure regularizers (optional)" above.
+
+| param | default | what it controls |
+|-------|---------|------------------|
+| `nested_dropout_p` | 0.0 | geometric truncation parameter; 0 disables. Each row keeps only `z[:k]`, `k ~ Geometric(p)`. `E[k] ≈ 1/p`: useful range ≈ `1/latent_dim` (gentle) to `2/latent_dim` (strong ordering). |
+| `jac_ortho_lambda` | 0.0 | weight on the decoder-Jacobian orthogonality penalty; 0 disables (no `jacfwd` cost at all). The raw penalty is a mean squared cosine ∈ [0, 1] (random directions in 51-dim feature space sit near 1/51 ≈ 0.02), so start at 1.0 and move by ×3. |
+| `jac_ortho_batch` | 128 | rows per step the penalty is evaluated on. Cost ≈ `latent_dim` decoder JVPs × this many rows — a few % overhead at defaults. |
+
+- **`nested_dropout_p` too high** — early dims are overloaded and total
+  recon degrades visibly; the truncation curve front-loads but the k =
+  `latent_dim` error is clearly worse than the unregularized run. Lower `p`.
+- **`nested_dropout_p` too low** — `truncation_curve` stays flat-high until
+  large k (no ordering emerged). Raise `p`.
+- **`jac_ortho_lambda`**: watch `history["epoch_jac_loss"]` — healthy runs
+  decay and plateau low while recon stays near baseline. If recon stalls or
+  gets noisy, the weight is too high. If `epoch_jac_loss` plateaus barely
+  below its starting value, it's too low to matter.
+- Validation loss is computed under the same truncation regime as training,
+  so val numbers are **not comparable across runs with different
+  `nested_dropout_p`** (use `loss_of`-style baselines or the truncation
+  curve to compare).
+
 ### Adversarial disentanglement
 
 Off by default. Turn on by setting `adv_lambda > 0`.
@@ -301,12 +371,14 @@ e.g. flat layout: `feature_path="{name}"`, `mask_path="{name}_mask"`.
 
 | key                  | shape       | meaning                                            |
 |----------------------|-------------|----------------------------------------------------|
-| `step_loss`          | (n_steps,)  | total training loss per step (recon + adv)         |
+| `step_loss`          | (n_steps,)  | total training loss per step (recon + adv + jac)   |
 | `step_recon_loss`    | (n_steps,)  | reconstruction component per step                  |
 | `step_adv_loss`      | (n_steps,)  | adversarial component per step (0 if `adv_lambda=0`) |
+| `step_jac_loss`      | (n_steps,)  | Jacobian-orthogonality penalty per step (0 if off) |
 | `epoch_train_loss`   | (n_epochs,) | mean total training loss per epoch                 |
 | `epoch_recon_loss`   | (n_epochs,) | mean reconstruction loss per epoch                 |
 | `epoch_adv_loss`     | (n_epochs,) | mean adversarial loss per epoch                    |
+| `epoch_jac_loss`     | (n_epochs,) | mean Jacobian-orthogonality penalty per epoch      |
 | `epoch_val_loss`     | (n_epochs,) | validation loss per epoch (recon only, if val given) |
 | `epoch_time`         | (n_epochs,) | seconds per epoch                                  |
 | `best_val_loss`      | float       | lowest val loss seen                               |

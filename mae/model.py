@@ -9,6 +9,7 @@ Single-class sklearn-style API:
     x_hat     = model.decode(z, c)                 # (N, n_features) from z + c
     score     = model.anomaly_score(x, m, c)       # (N,)
     per_feat  = model.per_feature_anomaly(x, m, c) # (N, n_features)
+    ks, err   = model.truncation_curve(x, m, c)    # recon error vs z[:k]
     model.save("ckpt.eqx")
     MaskedAutoencoder(n_features=51, n_cond=5).load("ckpt.eqx")
 
@@ -66,6 +67,33 @@ Optional adversarial disentanglement (`adv_lambda > 0`):
     before its gradient meaningfully shapes `z`. `adv_target_dims` chooses which
     columns of `c` to push out of `z` (default: all of `c`). Set `adv_lambda=0`
     (the default) to disable entirely.
+
+Optional latent-structure regularizers (both off by default, independent of
+each other and of the adversary). Plain reconstruction pins down only the
+latent *subspace*, not its basis — any invertible linear map of `z` can be
+absorbed by the decoder's first layer — so these break that symmetry to make
+individual dims meaningful:
+
+    Nested dropout (`nested_dropout_p > 0`): each training row draws
+    k ~ Geometric(p) clipped to `latent_dim`, and the decoder sees only
+    `z[:k]` (rest zeroed). Reconstruction-critical information is forced into
+    the early dims, so `z[:k]` is the best available k-dim code for every k —
+    PCA's ordered-components property, with a fully nonlinear map. Late dims
+    going quiet is dimensionality selection, not collapse. Diagnose with
+    `truncation_curve(...)`.
+
+    Jacobian orthogonality (`jac_ortho_lambda > 0`): penalizes the mean
+    squared cosine between columns of the decoder Jacobian ∂x̂/∂z (each column
+    is the feature-space direction latent i moves) on `jac_ortho_batch` rows
+    per step, pushing different dims toward locally *disjoint* effects —
+    curvilinear-orthogonal coordinates on the data manifold. Deliberately the
+    Gram/cosine form rather than a Hessian-diagonal penalty: it does not force
+    the decoder to be additive, so nonlinear interactions between latents stay
+    representable. Evaluated at the codes the decoder actually consumed
+    (truncated ones when nested dropout is on).
+
+The adversary always consumes the *full* (untruncated) code, so `c`-leakage
+is scrubbed from every dim regardless of truncation.
 """
 from __future__ import annotations
 
@@ -287,31 +315,75 @@ def _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w, qualit
     return (sq * w).sum() / jnp.clip(w.sum(), 1.0, None)
 
 
-def _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w):
+def _draw_keep_mask(key, n_rows, latent_dim, p):
+    """Per-row nested-dropout keep mask: k ~ Geometric(p), clipped to
+    [1, latent_dim]; dims [0, k) are kept, the rest zeroed. E[k] ≈ 1/p, and
+    rows whose draw exceeds latent_dim keep the full code.
+    """
+    u = jr.uniform(key, (n_rows,), minval=jnp.finfo(jnp.float32).tiny)
+    k = 1 + jnp.floor(jnp.log(u) / jnp.log1p(-p)).astype(jnp.int32)
+    k = jnp.clip(k, 1, latent_dim)
+    return (jnp.arange(latent_dim)[None, :] < k[:, None]).astype(jnp.float32)
+
+
+def _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, nd_p):
     """Shared kernel: artificial masking + forward + weighted recon loss.
 
-    Returns (recon_loss, z) so the adversary can also consume `z`.
+    Returns (recon_loss, z, z_dec, e): the full code `z` (the adversary always
+    sees every dim), the code the decoder actually consumed `z_dec`
+    (nested-dropout-truncated when `nd_p > 0`, else `z` itself), and the
+    conditioning embedding `e` (reused by the Jacobian-orthogonality penalty).
     """
-    m_extra = _draw_extra_mask(key, m_orig, mask_ratio)
-
-    def fwd(x_i, mo_i, me_i, c_i):
-        x_hat, z = _forward_single(model, x_i, mo_i, me_i, c_i)
-        return x_hat, z
-
-    x_hat, z = jax.vmap(fwd)(x, m_orig, m_extra, c)
+    k_mask, k_nd = jr.split(key)
+    m_extra = _draw_extra_mask(k_mask, m_orig, mask_ratio)
+    e = jax.vmap(model.conditioner)(c)
+    z = jax.vmap(model.encoder)(x, m_orig, m_extra, e)
+    if nd_p > 0.0:
+        keep = _draw_keep_mask(k_nd, z.shape[0], z.shape[1], nd_p)
+        z_dec = z * keep
+    else:
+        z_dec = z
+    x_hat = jax.vmap(model.decoder)(z_dec, e)
     recon = _weighted_recon_loss(x_hat, x, m_orig, m_extra, masked_w, unmasked_w, quality_w)
-    return recon, z
+    return recon, z, z_dec, e
+
+
+def _jac_ortho_loss(model, z, e):
+    """Mean squared cosine between decoder-Jacobian columns.
+
+    Column i of J = ∂x̂/∂z is the feature-space direction latent i moves at
+    this point; the penalty drives distinct latents toward locally orthogonal
+    (non-overlapping) effects without constraining each effect's shape or
+    forbidding interactions. Cosines make it scale-invariant — it can't be
+    gamed by shrinking the decoder's response — and near-dead dims (e.g.
+    truncated away by nested dropout) contribute ≈ 0.
+    """
+    def per_row(z_i, e_i):
+        J = jax.jacfwd(lambda zz: model.decoder(zz, e_i))(z_i)   # (F, L)
+        G = J.T @ J                                              # (L, L)
+        d = jnp.diag(G)
+        cos = G / jnp.sqrt(jnp.clip(d[:, None] * d[None, :], 1e-12, None))
+        L = G.shape[0]
+        off = cos * (1.0 - jnp.eye(L))
+        return (off ** 2).sum() / (L * (L - 1))
+    return jax.vmap(per_row)(z, e).mean()
 
 
 @eqx.filter_jit
-def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step):
-    """Total loss = recon_loss + adv_loss (adversary pushed via gradient reversal).
+def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w,
+             nd_p, jac_lambda, jac_batch, step):
+    """Total loss = recon + adv (via gradient reversal) + jac_lambda · jac.
 
     `step` is a JAX scalar (current global step) used to ramp the adversarial
     weight linearly from 0 to `model.adv_lambda` over `model.adv_warmup_steps`.
-    Returns (total_loss, (recon_loss, adv_loss)) for use with `has_aux=True`.
+    `nd_p`, `jac_lambda`, `jac_batch` arrive as Python scalars (static under
+    filter_jit), so the disabled branches compile away entirely.
+    Returns (total_loss, (recon_loss, adv_loss, jac_loss)) for `has_aux=True`.
     """
-    recon, z = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w)
+    recon, z, z_dec, e = _recon_and_z(
+        model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, nd_p
+    )
+    total = recon
 
     if model.adv_head is not None:
         target_idx = jnp.array(model.adv_target_dims, dtype=jnp.int32)
@@ -322,24 +394,39 @@ def _loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality
         z_grl = _grad_reverse(z, lam)
         c_pred = jax.vmap(model.adv_head)(z_grl)
         adv = jnp.mean((c_pred - c_target) ** 2)
-        total = recon + adv
+        total = total + adv
     else:
         adv = jnp.array(0.0)
-        total = recon
-    return total, (recon, adv)
+
+    if jac_lambda > 0.0:
+        n = min(int(jac_batch), z_dec.shape[0])
+        jac = _jac_ortho_loss(model, z_dec[:n], e[:n])
+        total = total + jac_lambda * jac
+    else:
+        jac = jnp.array(0.0)
+    return total, (recon, adv, jac)
 
 
 @eqx.filter_jit
-def _val_loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w):
-    """Validation: recon loss only (the metric we actually care about)."""
-    recon, _ = _recon_and_z(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w)
+def _val_loss_fn(model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, nd_p):
+    """Validation: recon loss only (the metric we actually care about).
+
+    Runs under the same nested-dropout regime as training so the number is
+    comparable to `epoch_recon_loss` — which also means val losses are not
+    comparable across runs with different `nested_dropout_p`.
+    """
+    recon, _, _, _ = _recon_and_z(
+        model, x, m_orig, c, key, mask_ratio, masked_w, unmasked_w, quality_w, nd_p
+    )
     return recon
 
 
 @eqx.filter_jit
-def _step_fn(model, opt_state, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step, optimizer):
+def _step_fn(model, opt_state, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w,
+             nd_p, jac_lambda, jac_batch, step, optimizer):
     (loss, aux), grads = eqx.filter_value_and_grad(_loss_fn, has_aux=True)(
-        model, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w, step
+        model, x, m, c, key, mask_ratio, masked_w, unmasked_w, quality_w,
+        nd_p, jac_lambda, jac_batch, step
     )
     updates, opt_state = optimizer.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -365,6 +452,23 @@ def _decode_fn(model, z, c):
         e = model.conditioner(c_i)
         return model.decoder(z_i, e)
     return jax.vmap(per_row)(z, c)
+
+
+@eqx.filter_jit
+def _trunc_err_fn(model, x, m, c, keep):
+    """Per-source observed-MSE reconstructing from the truncated code z·keep.
+
+    `keep` is a (latent_dim,) 0/1 vector shared by all rows; encoding uses the
+    catalog mask only (no extra masking). Backs `truncation_curve`.
+    """
+    def per_row(x_i, m_i, c_i):
+        e = model.conditioner(c_i)
+        z = model.encoder(x_i, m_i, _zeros_like_mask(m_i), e)
+        x_hat = model.decoder(z * keep, e)
+        sq = (x_hat - x_i) ** 2
+        w = 1.0 - m_i
+        return (sq * w).sum() / jnp.clip(w.sum(), 1.0, None)
+    return jax.vmap(per_row)(x, m, c)
 
 
 @eqx.filter_jit
@@ -460,6 +564,10 @@ class MaskedAutoencoder:
         learning_rate: float = 1e-3,
         n_epochs: int = 10,
         grad_clip: float = 1.0,
+        # latent structure regularizers (each off when 0)
+        nested_dropout_p: float = 0.0,
+        jac_ortho_lambda: float = 0.0,
+        jac_ortho_batch: int = 128,
         # adversarial disentanglement (off when adv_lambda == 0)
         adv_lambda: float = 0.0,
         adv_target_dims: Optional[Sequence[int]] = None,
@@ -467,6 +575,14 @@ class MaskedAutoencoder:
         adv_warmup_steps: int = 1000,
         seed: int = 0,
     ):
+        if not (0.0 <= nested_dropout_p < 1.0):
+            raise ValueError(f"nested_dropout_p must be in [0, 1), got {nested_dropout_p!r}")
+        if jac_ortho_lambda < 0:
+            raise ValueError(f"jac_ortho_lambda must be ≥ 0, got {jac_ortho_lambda!r}")
+        if jac_ortho_lambda > 0 and latent_dim < 2:
+            raise ValueError("jac_ortho_lambda > 0 needs latent_dim ≥ 2 (nothing to orthogonalize)")
+        if jac_ortho_batch < 1:
+            raise ValueError(f"jac_ortho_batch must be ≥ 1, got {jac_ortho_batch!r}")
         if adv_lambda < 0:
             raise ValueError(f"adv_lambda must be ≥ 0, got {adv_lambda!r}")
         if adv_warmup_steps < 0:
@@ -488,6 +604,9 @@ class MaskedAutoencoder:
         self.masked_loss_weight = masked_loss_weight
         self.unmasked_loss_weight = unmasked_loss_weight
         self.quality_loss_weight = float(quality_loss_weight)
+        self.nested_dropout_p = float(nested_dropout_p)
+        self.jac_ortho_lambda = float(jac_ortho_lambda)
+        self.jac_ortho_batch = int(jac_ortho_batch)
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.n_epochs = n_epochs
@@ -589,9 +708,11 @@ class MaskedAutoencoder:
             step_loss          per-step total training loss
             step_recon_loss    per-step reconstruction loss
             step_adv_loss      per-step adversarial loss (0 when adv off)
+            step_jac_loss      per-step Jacobian-orthogonality penalty (0 when off)
             epoch_train_loss   mean total training loss per epoch
             epoch_recon_loss   mean reconstruction loss per epoch
             epoch_adv_loss     mean adversarial loss per epoch
+            epoch_jac_loss     mean Jacobian-orthogonality penalty per epoch
             epoch_val_loss     mean validation (recon) loss per epoch (if val given)
             epoch_time         seconds per epoch
             best_val_loss      lowest val loss observed
@@ -622,13 +743,16 @@ class MaskedAutoencoder:
             ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         adv_on = self.model.adv_head is not None
+        jac_on = self.jac_ortho_lambda > 0.0
         history = {
             "step_loss": [],
             "step_recon_loss": [],
             "step_adv_loss": [],
+            "step_jac_loss": [],
             "epoch_train_loss": [],
             "epoch_recon_loss": [],
             "epoch_adv_loss": [],
+            "epoch_jac_loss": [],
             "epoch_val_loss": [],
             "epoch_time": [],
             "best_val_loss": float("inf"),
@@ -647,6 +771,7 @@ class MaskedAutoencoder:
             train_losses = []
             recon_losses = []
             adv_losses = []
+            jac_losses = []
             step_iter = self._iter_batches(x, mask, c, shuffle=True, rng=rng)
             if use_tqdm:
                 step_iter = tqdm(step_iter, total=n_steps_per_epoch,
@@ -658,18 +783,22 @@ class MaskedAutoencoder:
                 self.model, opt_state, loss, aux = _step_fn(
                     self.model, opt_state, xb, mb, cb, sub,
                     self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
-                    self.quality_loss_weight, step_arr, optimizer,
+                    self.quality_loss_weight, self.nested_dropout_p,
+                    self.jac_ortho_lambda, self.jac_ortho_batch, step_arr, optimizer,
                 )
                 global_step += 1
                 lf = float(loss)
                 rf = float(aux[0])
                 af = float(aux[1])
+                jf = float(aux[2])
                 train_losses.append(lf)
                 recon_losses.append(rf)
                 adv_losses.append(af)
+                jac_losses.append(jf)
                 history["step_loss"].append(lf)
                 history["step_recon_loss"].append(rf)
                 history["step_adv_loss"].append(af)
+                history["step_jac_loss"].append(jf)
 
                 if use_tqdm:
                     recent = train_losses[-50:]
@@ -677,9 +806,13 @@ class MaskedAutoencoder:
                     if adv_on:
                         postfix["recon"] = f"{rf:.4f}"
                         postfix["adv"] = f"{af:.4f}"
+                    if jac_on:
+                        postfix["jac"] = f"{jf:.4f}"
                     step_iter.set_postfix(**postfix)
                 if log_every and step_i % log_every == 0:
                     extra = f" recon={rf:.4f} adv={af:.4f}" if adv_on else ""
+                    if jac_on:
+                        extra += f" jac={jf:.4f}"
                     print(f"  epoch {epoch} step {step_i:6d} loss={lf:.4f}{extra}")
 
             val_l = float("nan")
@@ -692,7 +825,7 @@ class MaskedAutoencoder:
                     val_losses.append(float(_val_loss_fn(
                         self.model, xb, mb, cb, kk,
                         self.mask_ratio, self.masked_loss_weight, self.unmasked_loss_weight,
-                        self.quality_loss_weight,
+                        self.quality_loss_weight, self.nested_dropout_p,
                     )))
                 val_l = float(np.mean(val_losses))
                 history["epoch_val_loss"].append(val_l)
@@ -703,10 +836,12 @@ class MaskedAutoencoder:
             train_l = float(np.mean(train_losses))
             recon_l = float(np.mean(recon_losses))
             adv_l = float(np.mean(adv_losses))
+            jac_l = float(np.mean(jac_losses))
             dt = time.time() - t0
             history["epoch_train_loss"].append(train_l)
             history["epoch_recon_loss"].append(recon_l)
             history["epoch_adv_loss"].append(adv_l)
+            history["epoch_jac_loss"].append(jac_l)
             history["epoch_time"].append(dt)
 
             if use_tqdm:
@@ -714,6 +849,8 @@ class MaskedAutoencoder:
                 if adv_on:
                     postfix["recon"] = f"{recon_l:.4f}"
                     postfix["adv"] = f"{adv_l:.4f}"
+                if jac_on:
+                    postfix["jac"] = f"{jac_l:.4f}"
                 if has_val:
                     postfix["val"] = f"{val_l:.4f}"
                 epoch_bar.set_postfix(**postfix)
@@ -721,6 +858,8 @@ class MaskedAutoencoder:
                 msg = f"epoch {epoch}: train={train_l:.4f}"
                 if adv_on:
                     msg += f"  recon={recon_l:.4f}  adv={adv_l:.4f}"
+                if jac_on:
+                    msg += f"  jac={jac_l:.4f}"
                 if has_val:
                     msg += f"  val={val_l:.4f}"
                 msg += f"  ({dt:.1f}s)"
@@ -873,6 +1012,51 @@ class MaskedAutoencoder:
             out[i:i + xh.shape[0]] = np.asarray(xh)
         return out
 
+    def truncation_curve(
+        self,
+        x: np.ndarray,
+        mask: np.ndarray,
+        c: np.ndarray,
+        *,
+        ks: Optional[Sequence[int]] = None,
+        batch_size: Optional[int] = None,
+        progress: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Reconstruction error vs. latent truncation width k.
+
+        For each k, encodes with the catalog mask only, zeroes `z[k:]`, decodes,
+        and averages the per-source MSE over observed positions. The nested-
+        dropout diagnostic: with `nested_dropout_p > 0` the curve shows how much
+        each successive latent dim buys, and its knee is the effective
+        dimensionality of the code. Without nested dropout the decoder never saw
+        truncated codes, so expect the error to stay high until nearly all dims
+        are kept — the flat-then-cliff shape is itself evidence the basis is
+        arbitrary.
+
+        Cost is one encode+decode pass per k; run on a subset (~1e5 rows).
+
+        Returns `(ks, err)`: the truncation widths `(K,)` and the mean error
+        at each `(K,)`.
+        """
+        ks = (np.arange(1, self.latent_dim + 1) if ks is None
+              else np.asarray(list(ks), dtype=int))
+        if ks.ndim != 1 or ks.size == 0 or ks.min() < 1 or ks.max() > self.latent_dim:
+            raise ValueError(f"ks must be 1-D with values in [1, {self.latent_dim}]")
+        bs = batch_size or self.batch_size
+        rng = np.random.default_rng(0)
+        err = np.empty(ks.size, dtype=np.float64)
+        it = tqdm(ks, desc="truncation") if progress and tqdm is not None else ks
+        for j, k in enumerate(it):
+            keep = jnp.asarray((np.arange(self.latent_dim) < k).astype(np.float32))
+            tot, cnt = 0.0, 0
+            for xb, mb, cb in self._iter_batches(x, mask, c, shuffle=False,
+                                                 rng=rng, batch_size=bs):
+                eb = _trunc_err_fn(self.model, xb, mb, cb, keep)
+                tot += float(eb.sum())
+                cnt += eb.shape[0]
+            err[j] = tot / max(cnt, 1)
+        return ks, err
+
     def anomaly_score(
         self,
         x: np.ndarray,
@@ -980,8 +1164,11 @@ class MaskedAutoencoder:
     _CONFIG_KEYS = (
         "n_features", "n_cond",
         "latent_dim", "hidden_dim", "n_hidden_layers",
-        "mask_ratio", "batch_size", "learning_rate", "n_epochs", "grad_clip",
-        "loss_type",
+        "cond_embed_dim", "cond_embed_layers",
+        "mask_ratio", "masked_loss_weight", "unmasked_loss_weight",
+        "quality_loss_weight",
+        "batch_size", "learning_rate", "n_epochs", "grad_clip",
+        "nested_dropout_p", "jac_ortho_lambda", "jac_ortho_batch",
         "adv_lambda", "adv_target_dims", "adv_hidden", "adv_warmup_steps",
         "seed",
     )
@@ -1020,8 +1207,8 @@ class MaskedAutoencoder:
             saved = json.loads(cfg_path.read_text())
             current = self._config_dict()
             arch_keys = ("n_features", "n_cond", "latent_dim", "hidden_dim",
-                         "n_hidden_layers", "loss_type", "adv_lambda",
-                         "adv_target_dims", "adv_hidden")
+                         "n_hidden_layers", "cond_embed_dim", "cond_embed_layers",
+                         "adv_lambda", "adv_target_dims", "adv_hidden")
             mismatches = {k: (current.get(k), saved.get(k))
                           for k in arch_keys
                           if current.get(k) != saved.get(k)}

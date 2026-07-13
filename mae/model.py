@@ -69,6 +69,7 @@ Optional adversarial disentanglement (`adv_lambda > 0`):
 """
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Optional, Sequence
@@ -976,10 +977,84 @@ class MaskedAutoencoder:
         return out, sq.astype(np.float32)
 
     # --------------------------------------------------------------- I/O
+    _CONFIG_KEYS = (
+        "n_features", "n_cond",
+        "latent_dim", "hidden_dim", "n_hidden_layers",
+        "mask_ratio", "batch_size", "learning_rate", "n_epochs", "grad_clip",
+        "loss_type",
+        "adv_lambda", "adv_target_dims", "adv_hidden", "adv_warmup_steps",
+        "seed",
+    )
+
+    def _config_dict(self) -> dict:
+        cfg = {k: getattr(self, k) for k in self._CONFIG_KEYS}
+        if cfg["adv_target_dims"] is not None:
+            cfg["adv_target_dims"] = list(cfg["adv_target_dims"])
+        return cfg
+
+    @staticmethod
+    def _config_path(path: str | Path) -> Path:
+        path = Path(path)
+        return path.with_suffix(path.suffix + ".json")
+
     def save(self, path: str | Path):
+        """Serialize weights to `path` and architecture/config to `<path>.json`.
+
+        The sidecar lets `MaskedAutoencoder.from_checkpoint(path)` rebuild the
+        exact architecture without the caller knowing the hyperparameters.
+        """
+        path = Path(path)
         eqx.tree_serialise_leaves(str(path), self.model)
+        self._config_path(path).write_text(json.dumps(self._config_dict(), indent=2))
 
     def load(self, path: str | Path):
-        """Load weights into the current architecture (in place). Returns self."""
+        """Load weights into the current architecture (in place). Returns self.
+
+        The current `MaskedAutoencoder` must have been built with hyperparameters
+        matching the saved checkpoint. If a `<path>.json` sidecar exists it's
+        cross-checked and a clear error is raised on mismatch. If you don't
+        already have the architecture in hand, prefer `from_checkpoint(path)`.
+        """
+        cfg_path = self._config_path(path)
+        if cfg_path.exists():
+            saved = json.loads(cfg_path.read_text())
+            current = self._config_dict()
+            arch_keys = ("n_features", "n_cond", "latent_dim", "hidden_dim",
+                         "n_hidden_layers", "loss_type", "adv_lambda",
+                         "adv_target_dims", "adv_hidden")
+            mismatches = {k: (current.get(k), saved.get(k))
+                          for k in arch_keys
+                          if current.get(k) != saved.get(k)}
+            if mismatches:
+                lines = [f"  {k}: in-memory={cur!r}, on-disk={dsk!r}"
+                         for k, (cur, dsk) in mismatches.items()]
+                raise ValueError(
+                    "Architecture mismatch between in-memory model and saved "
+                    f"checkpoint at {path}:\n" + "\n".join(lines) +
+                    "\nUse MaskedAutoencoder.from_checkpoint(path) to rebuild "
+                    "from the saved config, or pass the matching hyperparameters."
+                )
         self.model = eqx.tree_deserialise_leaves(str(path), self.model)
         return self
+
+    @classmethod
+    def from_checkpoint(cls, path: str | Path) -> "MaskedAutoencoder":
+        """Construct a `MaskedAutoencoder` from `<path>.json` and load weights.
+
+        Requires the sidecar written by `save(...)`. For older checkpoints
+        without a sidecar, build the model manually with the matching
+        hyperparameters and call `.load(path)`.
+        """
+        cfg_path = cls._config_path(path)
+        if not cfg_path.exists():
+            raise FileNotFoundError(
+                f"No config sidecar at {cfg_path}. This file is needed to "
+                "reconstruct the architecture. For checkpoints saved before "
+                "the sidecar existed, build MaskedAutoencoder(...) manually "
+                "with the matching hyperparameters and call .load(path)."
+            )
+        cfg = json.loads(cfg_path.read_text())
+        cfg = {k: v for k, v in cfg.items() if k in cls._CONFIG_KEYS}
+        model = cls(**cfg)
+        model.load(path)
+        return model

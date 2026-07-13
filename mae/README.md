@@ -95,6 +95,39 @@ Practically: a galaxy that looks dim and a galaxy that looks bright should
 end up at the same latent location if they're the same morphology — FiLM
 lets the encoder "divide out" brightness instead of carrying it through.
 
+### Adversarial disentanglement (optional)
+
+FiLM lets the network *use* `c`, but doesn't stop the encoder from also
+encoding `c`-correlated information into `z`. If you plot `z` colored by
+e.g. r-magnitude and see a clear gradient, the encoder is leaking `c`
+through, even though FiLM is doing its job. This matters when you want
+`z` to capture *intrinsic* morphology rather than observational state.
+
+Setting `adv_lambda > 0` adds an adversarial head — a small MLP that
+predicts (a subset of) `c` from `z` — coupled to the encoder through a
+gradient-reversal layer (GRL). The GRL is identity in forward and flips
+the sign of the cotangent in backward, so a single MSE term
+
+    adv_loss = ‖adv_head(GRL(z, λ)) − c[:, target_dims]‖²
+
+simultaneously trains the head to be a *good* predictor and pushes the
+encoder to make `z` *unpredictive* of the targeted condition vars. The
+total objective is `recon_loss + adv_loss`.
+
+`λ` is ramped linearly from 0 to `adv_lambda` over `adv_warmup_steps` so
+the head becomes a competent predictor before its gradient meaningfully
+shapes `z` — otherwise the encoder gets pulled around by an untrained
+adversary. `adv_target_dims` chooses which columns of `c` to push out
+(default: all of `c` — the standard "z ⊥ c" formulation). To target only
+brightness, e.g. `adv_target_dims=(0,)`.
+
+Cost: the head is a tiny MLP (~1–2K params vs ~150K+ in the encoder).
+Per-step overhead is a few percent.
+
+To verify the gradient is gone after training, regress `c` from `z`
+(linear or MLP probe) on a held-out set — high R² means leakage remains;
+near-zero R² for the targeted dims means the adversary did its job.
+
 ### Training objective
 
 The real objective is **compression — encode 50 features in a `latent_dim`
@@ -204,6 +237,27 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
 - **`n_epochs`** — with ~100M sources, watch `epoch_val_loss` and stop
   when it flattens. 10 is a reasonable starting budget.
 
+### Adversarial disentanglement
+
+Off by default. Turn on by setting `adv_lambda > 0`.
+
+| param | default | what it controls |
+|-------|---------|------------------|
+| `adv_lambda` | 0.0 | weight on the adversarial loss after warmup. 0 disables the head entirely (no compute, no extra params). Start small (0.1–1.0) and raise if leakage persists. |
+| `adv_target_dims` | `None` (= all of `c`) | tuple of column indices in `c` to push out of `z`. e.g. `(0,)` for rmag-only. |
+| `adv_hidden` | 64 | hidden width of the adversary MLP (2 hidden layers). The head needs to be expressive enough to be a real predictor, but doesn't need to be deep. |
+| `adv_warmup_steps` | 1000 | steps over which `λ` ramps linearly from 0 to `adv_lambda`. Set ~ 1 epoch's worth of steps. |
+
+- **`adv_lambda` too high** — recon loss stalls, training is unstable, or
+  `z` collapses (encoder over-prioritizes fooling the adversary). Drop
+  `adv_lambda` or stretch `adv_warmup_steps`.
+- **`adv_lambda` too low** — adv loss in `history["epoch_adv_loss"]` keeps
+  falling indefinitely (head wins easily) and the rmag gradient in `z`
+  doesn't soften. Raise `adv_lambda`.
+- **Healthy run**: adv loss drops during warmup as the head learns, then
+  rises and plateaus as the encoder fights back. Recon loss decreases
+  monotonically (perhaps slightly worse than the no-adv baseline).
+
 ### Tuning by symptom
 
 - Anomaly score has no separation between obvious artifacts and normal
@@ -217,9 +271,12 @@ All model and training knobs are constructor kwargs on `MaskedAutoencoder`.
 - `latent_dim` doubled and val-loss barely moved → bottleneck wasn't the
   binding constraint; the encoder/decoder MLPs are.
 - `c`-leakage: cluster labels in `z` correlate strongly with brightness
-  → FiLM isn't separating out the conditioning. Train longer; if it
-  persists, increase `cond_embed_dim` / `cond_embed_layers` (the FiLM
-  conditioner's capacity to model non-linear `c` effects).
+  → FiLM gives the model a path to *use* `c` but does not force the
+  encoder to factor `c` *out* of `z`. First try training longer and
+  bumping `hidden_dim`. If the gradient persists and you want `z`
+  intrinsic-only, enable adversarial disentanglement (`adv_lambda > 0`,
+  `adv_target_dims=(0,)` for rmag-only or default-all-of-`c`). See
+  "Adversarial disentanglement" above.
 - Per-feature LOO error has one feature systematically off → that
   feature is the hardest to predict from the rest, which usually means
   it carries genuinely independent signal. Check whether it correlates
@@ -242,14 +299,18 @@ e.g. flat layout: `feature_path="{name}"`, `mask_path="{name}_mask"`.
 
 `model.train(...)` populates `model.history`:
 
-| key                  | shape       | meaning                                  |
-|----------------------|-------------|------------------------------------------|
-| `step_loss`          | (n_steps,)  | training loss at every optimizer step    |
-| `epoch_train_loss`   | (n_epochs,) | mean training loss per epoch             |
-| `epoch_val_loss`     | (n_epochs,) | validation loss per epoch (if val given) |
-| `epoch_time`         | (n_epochs,) | seconds per epoch                        |
-| `best_val_loss`      | float       | lowest val loss seen                     |
-| `best_epoch`         | int         | epoch index of best val loss             |
+| key                  | shape       | meaning                                            |
+|----------------------|-------------|----------------------------------------------------|
+| `step_loss`          | (n_steps,)  | total training loss per step (recon + adv)         |
+| `step_recon_loss`    | (n_steps,)  | reconstruction component per step                  |
+| `step_adv_loss`      | (n_steps,)  | adversarial component per step (0 if `adv_lambda=0`) |
+| `epoch_train_loss`   | (n_epochs,) | mean total training loss per epoch                 |
+| `epoch_recon_loss`   | (n_epochs,) | mean reconstruction loss per epoch                 |
+| `epoch_adv_loss`     | (n_epochs,) | mean adversarial loss per epoch                    |
+| `epoch_val_loss`     | (n_epochs,) | validation loss per epoch (recon only, if val given) |
+| `epoch_time`         | (n_epochs,) | seconds per epoch                                  |
+| `best_val_loss`      | float       | lowest val loss seen                               |
+| `best_epoch`         | int         | epoch index of best val loss                       |
 
 `progress=True` (default) shows nested tqdm bars (epoch + step). Pass
 `checkpoint_dir=...` to write `mae_epoch{NNN}.eqx` after every epoch.
@@ -326,15 +387,15 @@ x_hat_loo, sq_err = model.per_feature_anomaly(
 worst_feat = sq_err.argmax(axis=1)   # which feature drives the anomaly
 
 # 7. Persist. Save the model weights and the cond standardization stats so
-#    the same MAE can score new tiles consistently.
+#    the same MAE can score new tiles consistently. `save` writes
+#    `mae.eqx` (weights) plus `mae.eqx.json` (architecture sidecar).
 model.save("runs/mae_v1/mae.eqx")
 np.savez("runs/mae_v1/cond_stats.npz",
          cond_mu=ds.cond_mu, cond_sd=ds.cond_sd)
 
-# 8. Reload later (architecture must match — same n_features / n_cond /
-#    latent_dim / hidden_dim / n_hidden_layers).
-later = MaskedAutoencoder(n_features=ds.n_features, n_cond=ds.n_cond)
-later.load("runs/mae_v1/mae.eqx")
+# 8. Reload later. `from_checkpoint` reads the sidecar so you don't
+#    have to remember n_features / latent_dim / etc.
+later = MaskedAutoencoder.from_checkpoint("runs/mae_v1/mae.eqx")
 assert np.allclose(
     later.anomaly_score(ds.x[:1000], ds.mask[:1000], ds.c[:1000]),
     model.anomaly_score(ds.x[:1000], ds.mask[:1000], ds.c[:1000]),

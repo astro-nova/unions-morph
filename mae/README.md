@@ -365,6 +365,37 @@ MAEDataset(
 ```
 e.g. flat layout: `feature_path="{name}"`, `mask_path="{name}_mask"`.
 
+## Imbalanced catalogs
+
+Most of the catalog is small, low-S/N, poorly-resolved sources; loaded
+as-is they dominate training. `MAEDataset` can cap their share of the
+loaded sample (composes with `n_subset`):
+
+```python
+ds = MAEDataset(
+    ...,
+    n_subset=10_000_000,
+    frac_lowsnr=0.10, lowsnr_thresh=5.0,   # ≤10% with sn_per_pixel < 5
+    frac_lowres=0.10, lowres_thresh=0.9,   # ≤10% with fwhm > 0.9"
+)
+ds.balance_info   # totals, kept counts, achieved fractions
+```
+
+- Caps are "at most" constraints on the loaded sample (train **and** val —
+  the split happens after loading). While the flagged pool is plentiful
+  they are hit exactly.
+- Directions are fixed: low-S/N = value **below** `lowsnr_thresh`; poorly
+  resolved = FWHM **above** `lowres_thresh` (worse seeing).
+- Thresholds are raw catalog units, applied before standardization. The
+  variables are read via `cond_path` and need not be conditioning vars
+  (`lowsnr_var` / `lowres_var` default to `sn_per_pixel` / `fwhm`).
+- A source failing both cuts counts against both caps (singly-flagged rows
+  are drawn first so as much flagged data as possible survives).
+- If clean rows run out before reaching `n_subset`, the sample shrinks
+  (with a warning) instead of violating the caps.
+- `feat_median/iqr` and `cond_mu/sd` are computed on the rebalanced sample;
+  save them (worked example step 7) so later scoring uses the same scaling.
+
 ## Training trackers
 
 `model.train(...)` populates `model.history`:

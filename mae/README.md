@@ -384,8 +384,11 @@ ds.balance_info   # totals, kept counts, achieved fractions
 - Caps are "at most" constraints on the loaded sample (train **and** val —
   the split happens after loading). While the flagged pool is plentiful
   they are hit exactly.
-- Directions are fixed: low-S/N = value **below** `lowsnr_thresh`; poorly
-  resolved = FWHM **above** `lowres_thresh` (worse seeing).
+- A row is flagged when its variable is on the *bad* side of the threshold,
+  set by `lowsnr_side` / `lowres_side`. Defaults match the default vars:
+  lowsnr = **below** (small `sn_per_pixel`), lowres = **above** (large
+  `fwhm` = bad seeing). Override the side along with the variable — e.g. a
+  resolution-element count needs `lowres_side="below"`.
 - Thresholds are raw catalog units, applied before standardization. The
   variables are read via `cond_path` and need not be conditioning vars
   (`lowsnr_var` / `lowres_var` default to `sn_per_pixel` / `fwhm`).

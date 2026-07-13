@@ -47,9 +47,15 @@ class MAEDataset:
     training. Two caps bound their share of the *loaded* sample (train and
     val alike — the split happens downstream):
 
-        frac_lowsnr : at most this fraction with `lowsnr_var < lowsnr_thresh`
-        frac_lowres : at most this fraction with `lowres_var > lowres_thresh`
-                      (FWHM above threshold = worse seeing / less resolved)
+        frac_lowsnr : at most this fraction flagged by the lowsnr rule
+        frac_lowres : at most this fraction flagged by the lowres rule
+
+    A row is flagged when its variable falls on the *bad* side of the
+    threshold, chosen by `lowsnr_side` / `lowres_side` ("below" or "above"):
+    the lowsnr default is "below" (low S/N = small `sn_per_pixel`); the
+    lowres default is "above" (bad seeing = large `fwhm`). Override the side
+    together with the variable — e.g. a resolution-element count `nres`
+    needs `lowres_side="below"` (poorly resolved = few elements).
 
     Thresholds are in raw catalog units (applied before standardization).
     `lowsnr_var` / `lowres_var` are read via `cond_path` and do not need to
@@ -79,15 +85,19 @@ class MAEDataset:
         frac_lowsnr: Optional[float] = None,
         lowsnr_thresh: Optional[float] = None,
         lowsnr_var: str = "sn_per_pixel",
+        lowsnr_side: str = "below",
         frac_lowres: Optional[float] = None,
         lowres_thresh: Optional[float] = None,
         lowres_var: str = "fwhm",
+        lowres_side: str = "above",
         seed: int = 0,
     ):
-        for frac, thresh, label in (
-            (frac_lowsnr, lowsnr_thresh, "lowsnr"),
-            (frac_lowres, lowres_thresh, "lowres"),
+        for frac, thresh, side, label in (
+            (frac_lowsnr, lowsnr_thresh, lowsnr_side, "lowsnr"),
+            (frac_lowres, lowres_thresh, lowres_side, "lowres"),
         ):
+            if side not in ("below", "above"):
+                raise ValueError(f"{label}_side must be 'below' or 'above', got {side!r}")
             if frac is not None:
                 if not (0.0 <= frac <= 1.0):
                     raise ValueError(f"frac_{label} must be in [0, 1], got {frac!r}")
@@ -107,9 +117,11 @@ class MAEDataset:
         self.frac_lowsnr = frac_lowsnr
         self.lowsnr_thresh = lowsnr_thresh
         self.lowsnr_var = lowsnr_var
+        self.lowsnr_side = lowsnr_side
         self.frac_lowres = frac_lowres
         self.lowres_thresh = lowres_thresh
         self.lowres_var = lowres_var
+        self.lowres_side = lowres_side
         self.seed = seed
         self.balance_info: Optional[dict] = None
 
@@ -125,16 +137,14 @@ class MAEDataset:
         if self.frac_lowsnr is None and self.frac_lowres is None:
             return np.sort(rng.choice(n_total, size=self.n_subset, replace=False))
 
-        if self.frac_lowsnr is not None:
-            v = np.asarray(f[self.cond_path.format(name=self.lowsnr_var)][:])
-            flag_snr = v < self.lowsnr_thresh
-        else:
-            flag_snr = np.zeros(n_total, dtype=bool)
-        if self.frac_lowres is not None:
-            v = np.asarray(f[self.cond_path.format(name=self.lowres_var)][:])
-            flag_res = v > self.lowres_thresh
-        else:
-            flag_res = np.zeros(n_total, dtype=bool)
+        def flagged(var, thresh, side):
+            v = np.asarray(f[self.cond_path.format(name=var)][:])
+            return v < thresh if side == "below" else v > thresh
+
+        flag_snr = (flagged(self.lowsnr_var, self.lowsnr_thresh, self.lowsnr_side)
+                    if self.frac_lowsnr is not None else np.zeros(n_total, dtype=bool))
+        flag_res = (flagged(self.lowres_var, self.lowres_thresh, self.lowres_side)
+                    if self.frac_lowres is not None else np.zeros(n_total, dtype=bool))
         frac_snr = self.frac_lowsnr or 0.0
         frac_res = self.frac_lowres or 0.0
 

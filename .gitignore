@@ -210,3 +210,9 @@ data/
 catalogs/morph.csv
 catalogs/morph_new.csv
 catalogs/
+nbs/
+
+.DS_Store
+settings.json
+io_local.py
+morph_parallel_local.py

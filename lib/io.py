@@ -63,6 +63,17 @@ def download_files(coords, weightmap=False, segmap=False, tile=False, catalog=Fa
             except:
                 print('No photo-z catalog available yet')
 
+def download_cutout(coords, x, y, size, path='/scratch/'):
+    """ Download a cutout of a tile from VOSpace based on the provided coordinates and 
+    pixel position. `coords` should be in the XXX.YYY format following the UNIONS tile 
+    naming convention. Downloads to scratch unless path is specified."""
+
+    vosclient = Client()
+    tilename = f'CFIS_LSB.{coords}.r'
+    if not os.path.exists(f'{path}/cutout_{coords}_{x}_{y}.fits'):
+        vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.fits[{y-size}:{y+size},{x-size}:{x+size}]', 
+                    f'{path}/cutout_{coords}_{x}_{y}.fits')
+        
 def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     """ Make cutouts of a galaxy from the tile, weightmap and segmentation map.
     `galaxy` is a row from the catalog dataframe. `tile`, `weightmap` and `segmap` are  

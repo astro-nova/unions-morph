@@ -2,7 +2,7 @@ from vos import Client
 import numpy as np
 from skimage import transform as T
 from astropy.stats import sigma_clipped_stats
-from statmorph_lsst import _quantity_names
+
 import os
 import subprocess
 
@@ -119,7 +119,8 @@ def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     return img, err, segmap, mask, psf, bgsd
 
 def parse_morph(out_dict, morph):
-
+    from statmorph_lsst import _quantity_names
+    
     qs = _quantity_names
     qs += ['flag','flag_sersic']
     isophotes = np.arange(22, 26.5, 0.5)

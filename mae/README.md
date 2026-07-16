@@ -298,10 +298,14 @@ Off by default. See "Latent structure regularizers (optional)" above.
   `latent_dim` error is clearly worse than the unregularized run. Lower `p`.
 - **`nested_dropout_p` too low** — `truncation_curve` stays flat-high until
   large k (no ordering emerged). Raise `p`.
-- **`jac_ortho_lambda`**: watch `history["epoch_jac_loss"]` — healthy runs
-  decay and plateau low while recon stays near baseline. If recon stalls or
-  gets noisy, the weight is too high. If `epoch_jac_loss` plateaus barely
-  below its starting value, it's too low to matter.
+- **`jac_ortho_lambda`**: judge by the *trajectory* of
+  `history["epoch_jac_loss"]`, not its absolute value — it's a penalty, so
+  low is success. Healthy runs decay well below the random-direction
+  baseline of `1/n_features` (two random directions in feature space have
+  mean cos² ≈ 1/51 ≈ 0.02) and plateau there while recon stays near
+  baseline. If recon stalls or gets noisy, `jac_ortho_lambda` is too high;
+  if `epoch_jac_loss` ends roughly where it started, `jac_ortho_lambda` was
+  too low to exert any pressure.
 - Validation loss is computed under the same truncation regime as training,
   so val numbers are **not comparable across runs with different
   `nested_dropout_p`** (use `loss_of`-style baselines or the truncation

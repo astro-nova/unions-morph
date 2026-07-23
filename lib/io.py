@@ -68,6 +68,9 @@ def download_cutout(coords, x, y, size, path='/scratch/'):
     pixel position. `coords` should be in the XXX.YYY format following the UNIONS tile 
     naming convention. Downloads to scratch unless path is specified."""
 
+    x = int(x)
+    y = int(y)
+ 
     vosclient = Client()
     tilename = f'CFIS_LSB.{coords}.r'
     if not os.path.exists(f'{path}/cutout_{coords}_{x}_{y}.fits'):

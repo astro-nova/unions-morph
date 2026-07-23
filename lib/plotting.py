@@ -5,7 +5,11 @@ from matplotlib.patches import Ellipse, PathPatch
 from matplotlib.path import Path
 from scipy.stats import chi2, norm
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
- 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+
+
  
 
 def plot_cutouts(images, zp, pxscale, imsize=2, vmin=19, vmax=27):
@@ -22,9 +26,22 @@ def plot_cutouts(images, zp, pxscale, imsize=2, vmin=19, vmax=27):
     plt.subplots_adjust(wspace=0, hspace=0, left=0, right=1, top=1, bottom=0)
     return axs
 
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter
+def running_quantiles(x, y, step=2, window=10, q=[0.16,0.5,0.84]):
+    """ Compute running quantiles of y(x) using a sliding window. 
+    `step` is the step size in x, `window` is the window size in x. 
+    Returns (xcenters, qvals) where qvals is an array of shape (len(q), len(xcenters)). """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    xcenters = np.arange(np.min(x), np.max(x), step)
+    qvals = np.zeros((len(q), len(xcenters)))
+    for i, xc in enumerate(xcenters):
+        mask = (x > xc - window/2) & (x < xc + window/2)
+        if np.sum(mask) > 0:
+            qvals[:, i] = np.quantile(y[mask], q)
+        else:
+            qvals[:, i] = np.nan
+    return xcenters, qvals
+
 
 
 def make_smoothed_histogram(x, y, xlim, ylim, bins=50, sigma=1.5):

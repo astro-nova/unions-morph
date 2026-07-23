@@ -8,14 +8,14 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
  
  
 
-def plot_cutouts(images, zp, pxscale, imsize=2):
+def plot_cutouts(images, zp, pxscale, imsize=2, vmin=19, vmax=27):
 
     fig, axs = plt.subplots(1, len(images), figsize=(imsize*len(images), imsize))
     for ax, img in zip(axs, images):
         if img.dtype in [int, bool]:
             ax.imshow(img, origin='lower', cmap='gray', vmin=0, vmax=np.max(img)*0.8)
         else:
-            ax.imshow(-2.5*np.log10(np.abs(img)/pxscale**2)+zp, origin='lower', cmap='gray', vmin=19, vmax=27) 
+            ax.imshow(-2.5*np.log10(np.abs(img)/pxscale**2)+zp, origin='lower', cmap='gray', vmin=vmin, vmax=vmax) 
     
     for ax in axs:
         ax.axis('off')

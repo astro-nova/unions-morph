@@ -72,10 +72,10 @@ def download_cutout(coords, x, y, size, path='/scratch/'):
     y = int(y)
  
     vosclient = Client()
-    tilename = f'CFIS_LSB.{coords}.r'
-    if not os.path.exists(f'{path}/cutout_{coords}_{x}_{y}.fits'):
+    tilename = f'CFIS_LSB.{coords:0.3f}.r'
+    if not os.path.exists(f'{path}/cutout_{coords:0.3f}_{x}_{y}.fits'):
         vosclient.copy(f'vos:cfis/tiles_LSB_DR5/{tilename}.fits[{y-size}:{y+size},{x-size}:{x+size}]', 
-                    f'{path}/cutout_{coords}_{x}_{y}.fits')
+                    f'{path}/cutout_{coords:0.3f}_{x}_{y}.fits')
         
 def make_cutout(galaxy, tile, weightmap, segmap, cutout_min=20, r_frac=2):
     """ Make cutouts of a galaxy from the tile, weightmap and segmentation map.
